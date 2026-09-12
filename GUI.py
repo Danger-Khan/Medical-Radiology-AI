@@ -9,20 +9,37 @@ offline at run time: model weights are downloaded once and cached under models/,
 locally on every subsequent run.
 
 Run with:  python GUI.py
+
+Note: tkinter (and PIL's ImageTk, which wraps it) is intentionally NOT imported at module level.
+streamlit_app.py imports this module for its shared logic (constants, imaging, simulated
+scenarios, DB, reports, the run_triage() dispatcher) without ever touching the Tkinter UI, and
+some deployment environments (e.g. Streamlit Community Cloud's Linux containers) don't have the
+system Tk libraries tkinter needs, which would crash that import at module load time. See
+_lazy_import_tkinter() below — it's called only when the desktop UI actually runs.
 """
 import json
 import os
 import random
 import sqlite3
 import time
-import tkinter as tk
 from datetime import datetime
-from tkinter import ttk, filedialog, messagebox
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont, ImageTk
+from PIL import Image, ImageDraw, ImageFont
 
 import inference as inf
+
+
+def _lazy_import_tkinter():
+    """Import tkinter/ttk/filedialog/messagebox/ImageTk and bind them as module globals, but
+    only the first time the desktop UI is actually constructed — keeps GUI.py importable on
+    headless hosts that lack tkinter (see module docstring)."""
+    global tk, ttk, filedialog, messagebox, ImageTk
+    if "tk" in globals():
+        return
+    import tkinter as tk
+    from tkinter import ttk, filedialog, messagebox
+    from PIL import ImageTk
 
 # ============================================================
 # CONFIG / CONSTANTS
@@ -395,6 +412,7 @@ def generate_pdf_bytes(d):
 # ============================================================
 class PinkEdgeApp:
     def __init__(self, root):
+        _lazy_import_tkinter()
         self.root = root
         root.title("Pink Edge AI — Clinical Intelligence Platform (Desktop)")
         root.geometry("1280x820")
@@ -964,6 +982,7 @@ class PinkEdgeApp:
 
 
 def main():
+    _lazy_import_tkinter()
     root = tk.Tk()
     app = PinkEdgeApp(root)
     root.mainloop()
