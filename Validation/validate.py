@@ -2,13 +2,17 @@
 """
 Pink Edge AI (Desktop) — validation suite.
 ============================================
-Self-contained smoke/validation test for GUI.py + inference.py + streamlit_app.py: imports,
-imaging, simulated scenario generators, SQLite cache round-trip, text/PDF report generation, real
-model inference for all three modalities (each tries its Roboflow-hosted model first, then an
-offline Hugging Face/local-weights fallback, then SIMULATED — see inference.py), a ground-truth
-cross-check against a COCO-annotated mammography sample, the run_triage() dispatcher, and that
-both the Tkinter UI (hidden window, no mainloop) and the Streamlit UI (AppTest, no browser)
-actually build and can run one triage cycle.
+Self-contained smoke/validation test for GUI.py + inference.py + streamlit_app.py — 18 checks:
+imports, imaging, simulated scenario generators, SQLite cache round-trip, text/PDF report
+generation, real model inference for all three modalities on both synthetic AND real Test Data/
+images (each modality tries its Roboflow-hosted model first, then an offline Hugging Face/
+local-weights fallback, then SIMULATED — see inference.py), ground-truth cross-checks against each
+modality's real COCO-annotated dataset, the run_triage() dispatcher, and two full feature sweeps —
+Tkinter (hidden window, no mainloop: every modality driven with a real Test Data image, overlay
+toggle, save-to-cache, text/PDF report download, language toggle, network mode + cloud sync + OTA,
+Hospital Hub, Cloud Sync, Reset Session) and Streamlit (AppTest, no browser: every modality, model
+selectbox, save-to-cache, language toggle, network mode + cloud sync) — exercising the UI action
+methods themselves, not just the backend functions they call.
 
 Run with:  python Validation/validate.py   (from anywhere — paths below are anchored to the
 repo root, not the current working directory)
@@ -223,6 +227,20 @@ def _():
         print(f"    {os.path.basename(f):40s} -> {r['verdict']:15s} ({r['confidence']:.1f}%)")
 
 
+@check("Maternal real-model inference on real samples (Test Data/Maternal)")
+def _():
+    from PIL import Image
+
+    files = sorted(glob(os.path.join(TEST_DATA_DIR, "Maternal", "*")))
+    require(len(files) > 0, f"no sample files found under {TEST_DATA_DIR}\\Maternal")
+    for f in files:
+        img = Image.open(f)
+        r = inf.predict_maternal(img)
+        require(r is not None, f"predict_maternal returned None on real sample: {os.path.basename(f)}")
+        validate_result_shape(r, f"predict_maternal({os.path.basename(f)})")
+        print(f"    {os.path.basename(f):40s} -> {r['verdict']:25s} ({r['confidence']:.1f}%)")
+
+
 @check("Mammography pathway on real samples (Test Data/Breast Cancer)")
 def _():
     from PIL import Image
@@ -357,42 +375,164 @@ def _():
         require("source" in r, f"run_triage({model}): no source field")
 
 
-# ---- 8. Tkinter UI builds without error (hidden window, no mainloop) ----
-@check("Tkinter UI construction (hidden root, no mainloop)")
+# ---- 8. Tkinter UI: exercise every feature, driven by real Test Data images ----
+_TEST_DATA_BY_MODEL = {
+    "Mammography (YOLOv8-OBB)": "Breast Cancer",
+    "Tuberculosis (Chest X-Ray)": "Tuberculosis",
+    "Maternal Health (Ultrasound)": "Maternal",
+}
+
+
+@check("Tkinter UI: every feature exercised (real Test Data images, all 3 modalities)")
 def _():
     import tkinter as tk
+
     root = tk.Tk()
     root.withdraw()
+    tk_test_db = os.path.join(VALIDATION_DIR, "validation_test_cache_tk.db")
+    if os.path.exists(tk_test_db):
+        os.remove(tk_test_db)
+    orig_db_path = GUI.DB_PATH
+    GUI.DB_PATH = tk_test_db
     try:
         app = GUI.PinkEdgeApp(root)
         root.update()
         require(app.notebook.index("end") == 3, "expected 3 notebook tabs")
-        # exercise the model dropdown + triage path through the real widget code
-        app.model_var.set("Tuberculosis (Chest X-Ray)")
-        app._on_model_change()
-        app._run_triage()
-        root.update()
-        require(app.inference_done, "UI-driven _run_triage() did not complete")
-        require(app.current_result is not None, "UI-driven _run_triage() produced no result")
+
+        # Dialogs (askyesno/showinfo/askopenfilename/...) block waiting for a real click —
+        # mock them so this runs headlessly instead of hanging.
+        GUI.messagebox.showinfo = lambda *a, **k: None
+        GUI.messagebox.showwarning = lambda *a, **k: None
+        GUI.messagebox.showerror = lambda *a, **k: None
+        GUI.messagebox.askyesno = lambda *a, **k: True
+        saved_files = []
+
+        def _fake_save_dialog(*a, defaultextension="", initialfile="", **k):
+            path = os.path.join(VALIDATION_DIR, initialfile or f"out{defaultextension}")
+            saved_files.append(path)
+            return path
+
+        GUI.filedialog.asksaveasfilename = _fake_save_dialog
+
+        # Language toggle
+        app._set_lang(True)
+        require(GUI._urdu["on"], "language toggle to Urdu did not take effect")
+        app._set_lang(False)
+        require(not GUI._urdu["on"], "language toggle back to English did not take effect")
+
+        # Every modality: switch model, load a REAL Test Data image (not a placeholder),
+        # run triage, toggle the detection overlay, save to cache, download both report formats.
+        for model, folder in _TEST_DATA_BY_MODEL.items():
+            app.model_var.set(model)
+            app._on_model_change()
+
+            sample = sorted(glob(os.path.join(TEST_DATA_DIR, folder, "*")))
+            require(len(sample) > 0, f"no Test Data samples for {folder}")
+            app.uploaded_path = sample[0]
+            app._refresh_placeholder()
+            require(app.current_image is not None, f"{model}: no image loaded after upload")
+
+            app._run_triage()
+            root.update()
+            require(app.inference_done, f"{model}: _run_triage() did not complete")
+            require(app.current_result is not None, f"{model}: _run_triage() produced no result")
+
+            app.overlay_var.set(not app.overlay_var.get())
+            app._render_image()
+            app.overlay_var.set(not app.overlay_var.get())
+            app._render_image()
+
+            app._save_cache()
+            app._download_text()
+            app._download_pdf()
+
+        total, _ = GUI.counts()
+        require(total == len(_TEST_DATA_BY_MODEL), f"expected {len(_TEST_DATA_BY_MODEL)} cached reports, got {total}")
+        require(len(saved_files) == 2 * len(_TEST_DATA_BY_MODEL), f"expected {2 * len(_TEST_DATA_BY_MODEL)} report files, got {len(saved_files)}")
+        for p in saved_files:
+            require(os.path.isfile(p) and os.path.getsize(p) > 0, f"report file missing/empty: {p}")
+
+        # Network mode + Cloud Sync actions
+        app.network_var.set("GSM Failover")
+        app._refresh_actions()
+        app._sync_cloud()
+        app._check_ota()
+        require(app.acr_status is not None, "Check OTA did not set acr_status")
+
+        # Hospital Hub + Cloud Sync tabs actually render without error
+        app._refresh_hub()
+        require(len(app.sms_alerts) == len(_TEST_DATA_BY_MODEL), "Hospital Hub alert count mismatch")
+        app._refresh_cloud()
+
+        # Reset Session
+        app._reset_session()
+        require(not app.inference_done, "Reset Session did not clear inference_done")
+        require(app.sms_alerts == [], "Reset Session did not clear alerts")
     finally:
+        GUI.DB_PATH = orig_db_path
+        if os.path.exists(tk_test_db):
+            os.remove(tk_test_db)
+        for p in locals().get("saved_files", []):
+            if os.path.isfile(p):
+                os.remove(p)
         root.destroy()
 
 
-# ---- 9. Streamlit UI builds and runs one triage cycle (AppTest, no browser) ----
-@check("Streamlit UI construction + one triage cycle (AppTest, headless)")
+# ---- 9. Streamlit UI: exercise every feature (AppTest, no browser) ----
+@check("Streamlit UI: every feature exercised (all 3 modalities, language, network mode)")
 def _():
     from streamlit.testing.v1 import AppTest
 
-    at = AppTest.from_file(os.path.join(ROOT_DIR, "streamlit_app.py"))
-    at.run(timeout=60)
-    require(not at.exception, f"initial script run raised: {at.exception}")
+    tk_test_db = os.path.join(VALIDATION_DIR, "validation_test_cache_st.db")
+    if os.path.exists(tk_test_db):
+        os.remove(tk_test_db)
+    orig_db_path = GUI.DB_PATH
+    GUI.DB_PATH = tk_test_db
+    try:
+        at = AppTest.from_file(os.path.join(ROOT_DIR, "streamlit_app.py"))
+        at.run(timeout=60)
+        require(not at.exception, f"initial script run raised: {at.exception}")
+        require(len(at.tabs) == 3, f"expected 3 tabs (Dashboard/Hospital Hub/Cloud Sync), got {len(at.tabs)}")
 
-    # sidebar buttons in creation order: EN, Urdu, Run Triage, ...
-    at.sidebar.button[2].click().run(timeout=90)
-    require(not at.exception, f"Run Triage click raised: {at.exception}")
-    require(at.session_state["inference_done"], "Run Triage did not complete in the Streamlit app")
-    r = at.session_state["current_result"]
-    validate_result_shape(r, "streamlit run_triage")
+        # Language toggle: EN (0), Urdu (1)
+        at.sidebar.button[1].click().run(timeout=30)  # Urdu
+        require(not at.exception, f"Urdu toggle raised: {at.exception}")
+        at.sidebar.button[0].click().run(timeout=30)  # back to English
+        require(not at.exception, f"English toggle raised: {at.exception}")
+
+        # Every modality, via the sidebar model selectbox (uses the generated placeholder —
+        # AppTest can't drive a real file_uploader interaction, so Test Data images are covered
+        # by the direct inf.predict_*() checks above instead; this covers the full UI path).
+        for model in GUI.MODELS:
+            at.sidebar.selectbox[0].select(model).run(timeout=30)
+            require(not at.exception, f"{model}: selecting the model raised: {at.exception}")
+            at.sidebar.button[2].click().run(timeout=90)  # Run Triage
+            require(not at.exception, f"{model}: Run Triage raised: {at.exception}")
+            require(at.session_state["inference_done"], f"{model}: Run Triage did not complete")
+            r = at.session_state["current_result"]
+            validate_result_shape(r, f"streamlit run_triage({model})")
+
+            save_idx = 3  # Save to Cache appears once inference_done is True
+            require(len(at.sidebar.button) > save_idx, f"{model}: Save to Cache button not rendered")
+            at.sidebar.button[save_idx].click().run(timeout=30)
+            require(not at.exception, f"{model}: Save to Cache raised: {at.exception}")
+
+        total, _ = GUI.counts()
+        require(total == len(GUI.MODELS), f"expected {len(GUI.MODELS)} cached reports, got {total}")
+
+        # Network mode -> GSM Failover unlocks Sync to Cloud / Check OTA
+        at.sidebar.radio[0].set_value("GSM Failover").run(timeout=30)
+        require(not at.exception, f"network mode switch raised: {at.exception}")
+        sync_buttons = [i for i, b in enumerate(at.sidebar.button) if "Sync to Cloud" in b.label]
+        require(sync_buttons, "Sync to Cloud button not found after switching to GSM Failover")
+        at.sidebar.button[sync_buttons[0]].click().run(timeout=30)
+        require(not at.exception, f"Sync to Cloud raised: {at.exception}")
+        _, unsynced = GUI.counts()
+        require(unsynced == 0, f"expected 0 unsynced after Sync to Cloud, got {unsynced}")
+    finally:
+        GUI.DB_PATH = orig_db_path
+        if os.path.exists(tk_test_db):
+            os.remove(tk_test_db)
 
 
 # ============================================================
