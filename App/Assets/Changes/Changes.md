@@ -96,6 +96,20 @@ on the same 50 held-out samples), Mammography gets it as a second offline option
 failing on purpose in the previous pass — now **passes for real**, because the underlying problem
 got fixed rather than tolerated.
 
+## Repo reorganization — everything moved into `App/`
+Root cleaned up to exactly 3 visible things: `README.md`, `Start.bat`, `Start_Web.bat`. Everything
+else (`GUI.py`, `inference.py`, `offline_cv.py`, `streamlit_app.py`, `requirements.txt`,
+`roboflow_key.txt`, `pink_edge_cache.db`, `.streamlit/`, `.python-version`, `Models/`,
+`Documentations/`, `Hardware/`, `Assets/`, `Test Data/`, `Validation/`, `Misc/`) moved into a new
+`App/` folder as one unit, preserving relative structure — no internal `../`-style references broke
+since everything that referenced everything else moved together. What *did* need updating: both
+launchers now `cd` into `App/` before running anything; `.gitignore` patterns that had a `/` in them
+(anchored, not "any depth") got an `App/` prefix; root `README.md` rewritten with the new paths,
+including an honest note that the Streamlit Community Cloud deploy path (`Main file path:
+App/streamlit_app.py` now, not `streamlit_app.py`) hasn't been re-verified against this layout yet.
+Verified by actually running `Start.bat`/`Start_Web.bat` (not just the underlying Python) and the
+full `Validation/validate.py` suite from the new location — 19/19 still pass.
+
 ## Hardware planning docs (`Hardware/`)
 New folder, purely documentation/diagrams — no app code touched. Compares the four hardware ideas
 given (RK3588 SBC, Raspberry Pi, mobile APK, ESP32) as what they actually are: three candidate main
