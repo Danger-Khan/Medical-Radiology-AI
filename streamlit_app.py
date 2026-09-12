@@ -2,11 +2,14 @@
 """
 Pink Edge AI — Streamlit (responsive web) edition
 ====================================================
-A responsive web UI, sibling to the Tkinter desktop app (GUI.py) — same shared logic, same real
-on-device models (TB, Maternal Health) with the same SIMULATED fallback (Mammography), same SQLite
-cache. All shared logic (constants, imaging, simulated scenarios, DB, reports, the run_triage()
-dispatcher) is imported straight from GUI.py rather than duplicated — GUI.py's Tkinter code never
-runs unless GUI.py itself is executed directly, so importing it here is safe.
+A responsive web UI, sibling to the Tkinter desktop app (GUI.py) — same shared logic, same model
+backend (inference.py: Roboflow-hosted models, the offline_cv.py pixel-diff heuristic, offline HF
+models, and the SIMULATED scenario picker, tried in whichever order is measurably best per
+modality — see Documentations/MODEL_SOURCES.md), same SQLite cache. All shared logic (constants,
+imaging, simulated scenarios, DB, reports, the run_triage() dispatcher, draw_bbox() — which now
+draws a real detected bounding box when a result carries one, e.g. from offline_cv.py) is imported
+straight from GUI.py rather than duplicated — GUI.py's Tkinter code never runs unless GUI.py itself
+is executed directly, so importing it here is safe.
 
 Run with:  streamlit run streamlit_app.py
 """
@@ -210,7 +213,7 @@ def run_triage_action(selected_model, uploaded):
     st.session_state.pat_id = random.randint(10000000, 99999999)
     st.session_state.pat_age = random.randint(28, 75)
 
-    real = "real inference" in result.get("source", "")
+    real = "SIMULATED" not in result.get("source", "")  # covers Roboflow, offline HF models, AND the offline_cv.py heuristic
     st.session_state.log_entries.append(
         f"[{time.strftime('%H:%M:%S')}] [NPU] {'Real on-device' if real else 'Simulated'} inference "
         f"for {selected_model.split('(')[0].strip()}... Complete ({st.session_state.inference_latency}s).")
@@ -260,7 +263,7 @@ def sync_cloud_action():
 # ============================================================
 def render_dashboard(selected_model):
     st.markdown(f"""<div class="page-header"><h1>🩸 Pink Edge AI</h1>
-    <p>Clinical Intelligence Platform • Real on-device models (TB, Maternal Health) + simulated fallback</p></div>""",
+    <p>Clinical Intelligence Platform • Roboflow-hosted + offline pixel-diff models, per-modality accuracy-ranked</p></div>""",
                 unsafe_allow_html=True)
 
     col_img, col_meta = st.columns([3, 2])

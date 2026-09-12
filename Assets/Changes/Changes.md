@@ -96,6 +96,16 @@ on the same 50 held-out samples), Mammography gets it as a second offline option
 failing on purpose in the previous pass — now **passes for real**, because the underlying problem
 got fixed rather than tolerated.
 
+## streamlit_app.py follow-up fixes
+`core.draw_bbox()` is shared with `GUI.py`, so the offline heuristic's real bounding boxes were
+already live in the Streamlit edition automatically — no change needed there. Two things weren't
+automatic and needed fixing directly in `streamlit_app.py`: its own `"real inference" in source`
+check (same bug pattern as `Validation/validate.py` had) was tagging offline_cv.py results as
+"Simulated" in the telemetry log since that source string doesn't contain that exact phrase —
+switched to the same `"SIMULATED" not in source` check; and the dashboard header / module
+docstring still described the old "TB+Maternal real, Mammography simulated" state, updated to
+reflect the current accuracy-ranked multi-method precedence.
+
 ## Validation
 Added `Validation/validate.py` — a 14-check validation suite covering module imports, placeholder
 image synthesis, the detection-overlay drawing, the simulated scenario generators, a full SQLite
