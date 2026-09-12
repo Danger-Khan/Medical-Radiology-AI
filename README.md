@@ -9,19 +9,22 @@ demo (see `Misc/`): a Tkinter **desktop** app (`GUI.py`) and a responsive **Stre
 
 Clinical-triage UI for three modalities — Mammography, Tuberculosis (chest X-ray), Maternal Health
 (ultrasound) — matching the original app's dashboard, hospital-hub alert feed, and simulated
-Alibaba-Cloud-sync panel. Each modality tries the user's own trained model on **Roboflow** first
-(workspace `imaad-ullah-khan-yameen`), then falls back offline:
+Alibaba-Cloud-sync panel. Each modality tries multiple methods in an order set by **measured
+accuracy against real ground truth**, not by "online first":
 
-| Modality | Primary (Roboflow, needs a key + internet) | Offline fallback |
+| Modality | Try order | Measured accuracy |
 |---|---|---|
-| Mammography | Workflow `breastcancer-yolov8-78tni` | Simulated (no local weights present) |
-| Tuberculosis | Model `tuberculosis-tp2pv/1` — ⚠️ **known accuracy issue**, see MODEL_SOURCES.md | [sukhmani1303/tuberculosis-vit-model](https://huggingface.co/sukhmani1303/tuberculosis-vit-model) |
-| Maternal Health | Model `hash-maternal-health/1` | [shr3m/fetal-brain-plane-cnn](https://huggingface.co/shr3m/fetal-brain-plane-cnn) |
+| Mammography | Roboflow Workflow `breastcancer-yolov8-78tni` → offline pixel-diff heuristic → Simulated | Roboflow: correctly flagged ground truth (90.9%). Offline heuristic: **96%** |
+| Tuberculosis | **Offline pixel-diff heuristic** → Roboflow model → offline HF ViT | Offline heuristic: **74%** (best of the three — Roboflow model has a ⚠️ known issue, see MODEL_SOURCES.md) |
+| Maternal Health | Roboflow model `hash-maternal-health/1` → offline HF CNN | Roboflow: correctly flagged ground truth (88.3%) |
 
-**Important:** with a Roboflow key configured, all three modalities become cloud-dependent at
-inference time (not offline) — that's a deliberate tradeoff for real, purpose-trained predictions;
-see MODEL_SOURCES.md if you want to flip a modality back to offline-only. Full detail on every
-model (grounding, exact preprocessing, license, and the TB accuracy finding) is in
+The **offline pixel-diff heuristic** (`offline_cv.py`) needs no model weights and no internet,
+ever — it builds "typical positive" / "typical negative" reference images by averaging your own
+local labeled datasets (`Models/*/Data Set/`) and compares new images against both, drawing a real
+bounding box around whatever region actually differs. Run `python offline_cv.py` to see its
+measured accuracy against held-out data for yourself. The Roboflow calls need a key + internet
+(cloud-dependent at inference time — a deliberate tradeoff for real predictions when available).
+Full detail (grounding, exact preprocessing, license, the TB accuracy finding) is in
 [Documentations/MODEL_SOURCES.md](Documentations/MODEL_SOURCES.md). This is a hackathon-grade demo,
 not a validated medical device — confidence numbers and severity mappings are illustrative.
 
@@ -63,15 +66,19 @@ All three modalities check for a Roboflow API key and use it if present:
 ```
 GUI.py                    — Tkinter desktop app: UI + local SQLite cache + reports + fallbacks
 streamlit_app.py           — Streamlit web app (responsive) — same logic, imported from GUI.py
-inference.py                — real model loading + prediction for all three modalities
+inference.py                — model loading + prediction dispatch for all three modalities
+offline_cv.py                — the offline pixel-diff heuristic (no model, no internet, ever);
+                                  run directly (`python offline_cv.py`) to see its measured accuracy
 requirements.txt            — Python dependencies (shared by both editions)
 Start.bat / Start_Web.bat    — one-click installer + launcher, desktop / web
 pink_edge_cache.db           — local report cache (SQLite; created on first "Save to Cache")
 
-Models/                  — downloaded weight cache, one folder per modality
+Models/                  — downloaded weight cache + local datasets, one folder per modality
   TB/model.pt                          — sukhmani1303/tuberculosis-vit-model (TorchScript)
   Maternal/FINAL-test-evaluation.pt    — shr3m/fetal-brain-plane-cnn
   Mammography/                         — populated only if you add a Roboflow key (see above)
+  */Data Set/                          — local labeled datasets offline_cv.py builds templates from
+  */templates/                         — offline_cv.py's generated reference images (gitignored, auto-rebuilt)
 
 Validation/
   validate.py             — validation suite, run with `python Validation/validate.py`
@@ -96,14 +103,15 @@ Misc/                     — the original hackathon submission this was built f
 ```
 python Validation/validate.py
 ```
-14 checks covering: module imports, placeholder image synthesis, detection overlay drawing, the
+19 checks covering: module imports, placeholder image synthesis, detection overlay drawing, the
 simulated scenario generators, a full SQLite cache round-trip (on a throwaway DB under `Validation/`
 — never touches the real `pink_edge_cache.db`), text/PDF report generation, real-model inference for
-TB and Maternal Health (both on synthetic images *and* the real samples in `Test Data/`), the
-mammography SIMULATED-fallback path, the `run_triage()` dispatcher for all 3 modalities, that the
-Tkinter UI builds and can run one triage cycle end-to-end with no visible window, and that the
-**Streamlit UI** builds and runs one triage cycle headlessly via `streamlit.testing.v1.AppTest` (no
-browser needed). Exits non-zero (and prints `inference.py`'s per-modality model status) if anything
+all three modalities on both synthetic images *and* the real samples in `Test Data/`, ground-truth
+cross-checks against each modality's real COCO-annotated dataset (including an accuracy floor for
+the offline pixel-diff heuristic), the `run_triage()` dispatcher, and two full feature sweeps — every
+modality, save-to-cache, report downloads, language toggle, network mode, cloud sync — for both the
+**Tkinter UI** (hidden window, no mainloop) and the **Streamlit UI** (`streamlit.testing.v1.AppTest`,
+no browser). Exits non-zero (and prints `inference.py`'s per-modality model status) if anything
 fails. Works from any working directory — paths are anchored to the repo root, not the caller's CWD.
 
 ## Deploy the web edition to Streamlit Community Cloud

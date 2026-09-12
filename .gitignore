@@ -5,6 +5,10 @@ Models/*/*.onnx
 Models/*/.cache/
 Models/*/*/.cache/
 
+# offline_cv.py's generated reference templates — deterministically rebuilt from the datasets
+# already in Models/*/Data Set/ on first use, no need to commit the derived output.
+Models/*/templates/
+
 # Local runtime artifacts
 pink_edge_cache.db
 Validation/validation_test_cache.db

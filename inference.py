@@ -287,6 +287,19 @@ def _predict_tb_roboflow(pil_image: Image.Image) -> dict:
 
 
 def predict_tb(pil_image: Image.Image) -> dict:
+    # Measured against 50 held-out ground-truth samples (see calibrate() in offline_cv.py /
+    # Documentations/MODEL_SOURCES.md): offline heuristic 74% > offline HF ViT 62% > Roboflow
+    # model 0% on healthy samples (biased). Offline-first here isn't just "prefer offline on
+    # principle" — it's measurably the best of the three for this modality right now.
+    try:
+        import offline_cv
+
+        r = offline_cv.predict("tb", pil_image)
+        if r is not None:
+            return r
+    except Exception:
+        pass
+
     try:
         return _predict_tb_roboflow(pil_image)
     except RoboflowError:
@@ -429,7 +442,20 @@ def predict_maternal(pil_image: Image.Image) -> dict:
     try:
         return _predict_maternal_roboflow(pil_image)
     except RoboflowError:
-        pass  # no key / offline / call failed — fall through to the offline model below
+        pass  # no key / offline / call failed — fall through to the offline paths below
+
+    try:
+        import offline_cv
+
+        # Currently always returns None for this modality: the Maternal dataset has zero
+        # unannotated/negative images to build a negative reference from (every local image is
+        # an annotated 'abnormal' case) — see offline_cv.calibrate(). Kept here (harmless) so
+        # this modality picks it up automatically if the dataset ever gains negative examples.
+        r = offline_cv.predict("maternal", pil_image)
+        if r is not None:
+            return r
+    except Exception:
+        pass
 
     model = load_maternal_model()
     if model is None:
@@ -566,7 +592,18 @@ def predict_mammography(pil_image: Image.Image) -> dict:
     try:
         return _predict_mammography_workflow(pil_image)
     except RoboflowError:
-        pass  # no key / offline / call failed — fall through to local weights below, then None
+        pass  # no key / offline / call failed — fall through to the offline paths below
+
+    try:
+        import offline_cv
+
+        # Measured 96% on 50 held-out ground-truth samples (offline_cv.calibrate()) — a strong,
+        # fully-offline fallback for when the hosted Workflow above is unreachable.
+        r = offline_cv.predict("mammography", pil_image)
+        if r is not None:
+            return r
+    except Exception:
+        pass
 
     model = load_mammography_model()
     if model is None:
@@ -599,22 +636,36 @@ def predict_mammography(pil_image: Image.Image) -> dict:
 
 
 def model_status() -> dict:
-    """One line per modality: whether it's backed by a real model, and why not if not.
-    Each modality tries its Roboflow-hosted model first (imaad-ullah-khan-yameen workspace),
-    then an offline fallback (Hugging Face for TB/Maternal, local weights for Mammography)."""
+    """One line per modality: whether it's backed by a real model, and why not if not. Try
+    order (see predict_tb/predict_maternal/predict_mammography): Roboflow-hosted model first
+    where it's measurably the best option (Mammography, Maternal), or the offline pixel-diff
+    heuristic first where it measurably beats Roboflow (TB — see offline_cv.py calibrate() /
+    Documentations/MODEL_SOURCES.md), then the offline Hugging Face model as the deepest
+    fallback."""
     roboflow_ok = _roboflow_api_key() is not None
+    try:
+        import offline_cv
+
+        offline_cv_tb = offline_cv.available("tb")
+        offline_cv_mammo = offline_cv.available("mammography")
+    except Exception:
+        offline_cv_tb = offline_cv_mammo = False
+
     return {
         "Mammography (YOLOv8-OBB)": {
-            "real": roboflow_ok or mammography_available(),
-            "reason": "OK (Roboflow workflow)" if roboflow_ok else (_mammo_load_error or "OK"),
+            "real": roboflow_ok or offline_cv_mammo or mammography_available(),
+            "reason": "OK (Roboflow workflow)" if roboflow_ok
+            else ("OK (offline pixel-diff heuristic, ~96% on held-out data)" if offline_cv_mammo else (_mammo_load_error or "OK")),
             "source": f"Roboflow workflow {ROBOFLOW_MAMMOGRAPHY_WORKFLOW_ID}" if roboflow_ok
-            else "Roboflow b-davmu/breastcancer-yolov8 (local weights)",
+            else ("offline_cv.py heuristic (local BreastCancer-YOLOv8.coco dataset)" if offline_cv_mammo
+                  else "Roboflow b-davmu/breastcancer-yolov8 (local weights)"),
         },
         "Tuberculosis (Chest X-Ray)": {
-            "real": roboflow_ok or tb_available(),
-            "reason": "OK (Roboflow model)" if roboflow_ok else (_tb_load_error or "OK"),
-            "source": f"Roboflow {ROBOFLOW_TB_MODEL_ID}" if roboflow_ok
-            else "sukhmani1303/tuberculosis-vit-model (Hugging Face)",
+            "real": offline_cv_tb or roboflow_ok or tb_available(),
+            "reason": "OK (offline pixel-diff heuristic, ~74% on held-out data — best measured of the 3 TB options)" if offline_cv_tb
+            else ("OK (Roboflow model)" if roboflow_ok else (_tb_load_error or "OK")),
+            "source": "offline_cv.py heuristic (local tuberculosis.coco dataset)" if offline_cv_tb
+            else (f"Roboflow {ROBOFLOW_TB_MODEL_ID}" if roboflow_ok else "sukhmani1303/tuberculosis-vit-model (Hugging Face)"),
         },
         "Maternal Health (Ultrasound)": {
             "real": roboflow_ok or maternal_available(),

@@ -75,6 +75,27 @@ Also added: a shared Roboflow client layer in `inference.py` (`RoboflowError`, r
 cross-checks for all three modalities against their real COCO-annotated datasets (which the user
 added under `Models/*/Data Set/`), not just "did it return something."
 
+## Offline pixel-diff heuristic (`offline_cv.py`) — no model, no internet, ever
+Added per a direct request for a fully-offline method: image → grayscale → resize/orient (try
+identity vs. horizontal-flip, keep whichever best correlates with a generic reference — handles
+left/right laterality without full registration) → average local labeled images into "typical
+positive"/"typical negative" reference templates → pixel-difference the uploaded image against
+both → the region that's furthest from negative and closest to positive becomes a **real** bounding
+box (not the old illustrative fixed position — `draw_bbox()` in `GUI.py` now draws it when
+present) → the mean of that difference map becomes the confidence score.
+
+**Measured, not assumed**, on a proper held-out test split (`python offline_cv.py`): **74% for TB,
+96% for Mammography**. Maternal Health has no negative/healthy images anywhere in its local
+dataset (every image is an annotated abnormal case), so it correctly returns `None` there rather
+than guessing.
+
+This directly fixed the TB accuracy problem documented above: TB's try-order now puts this
+heuristic first (74%, beats both the Roboflow model's 0%-on-healthy and the offline HF ViT's 62%
+on the same 50 held-out samples), Mammography gets it as a second offline option after the
+(well-performing) Roboflow Workflow. `Validation/validate.py`'s TB ground-truth check — left
+failing on purpose in the previous pass — now **passes for real**, because the underlying problem
+got fixed rather than tolerated.
+
 ## Validation
 Added `Validation/validate.py` — a 14-check validation suite covering module imports, placeholder
 image synthesis, the detection-overlay drawing, the simulated scenario generators, a full SQLite

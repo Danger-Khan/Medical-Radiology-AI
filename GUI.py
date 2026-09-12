@@ -293,22 +293,33 @@ def draw_bbox(image, model_name, result):
     conf_str = f"{result['confidence']:.1f}%" if result else "94.2%"
     color = (236, 72, 153) if is_critical else (16, 185, 129)
 
+    # offline_cv.py's pixel-comparison heuristic returns a REAL detected region (normalized
+    # (x, y, w, h) fractions) rather than an illustrative fixed position — use it when present.
+    real_bbox = result.get("bbox") if result else None
+    if real_bbox:
+        rx, ry, rw, rh = real_bbox
+        default_center = (int((rx + rw / 2) * w), int((ry + rh / 2) * h))
+        default_size = (max(int(rw * w), 20), max(int(rh * h), 20))
+    else:
+        default_center = default_size = None
+
     if "Mammography" in model_name:
-        center = (int(w * 0.68), int(h * 0.35))
-        box = _rotated_box(center, (int(w * 0.15), int(h * 0.12)), 35)
+        center = default_center or (int(w * 0.68), int(h * 0.35))
+        size = default_size or (int(w * 0.15), int(h * 0.12))
+        box = _rotated_box(center, size, 0 if real_bbox else 35)
         draw.polygon(box, outline=color, width=2)
         for pt in box:
             draw.ellipse([pt[0] - 5, pt[1] - 5, pt[0] + 5, pt[1] + 5], fill=color)
         label = f"YOLOv8-OBB: {'Malignant' if is_critical else 'Benign'} ({conf_str})"
     elif "Tuberculosis" in model_name:
-        center = (int(w * 0.35), int(h * 0.30))
-        bw, bh = int(w * 0.12), int(h * 0.10)
+        center = default_center or (int(w * 0.35), int(h * 0.30))
+        bw, bh = default_size or (int(w * 0.12), int(h * 0.10))
         draw.rectangle([center[0] - bw // 2, center[1] - bh // 2, center[0] + bw // 2, center[1] + bh // 2],
                         outline=color, width=2)
         label = f"TB Classifier: {'Active Lesion' if is_critical else 'Clear'} ({conf_str})"
     else:
-        center = (int(w * 0.50), int(h * 0.50))
-        r = int(w * 0.15)
+        center = default_center or (int(w * 0.50), int(h * 0.50))
+        r = max(default_size) // 2 if default_size else int(w * 0.15)
         draw.ellipse([center[0] - r, center[1] - r, center[0] + r, center[1] + r], outline=color, width=2)
         label = f"Fetal Health: {'Review Needed' if is_critical else 'Normal'} ({conf_str})"
 

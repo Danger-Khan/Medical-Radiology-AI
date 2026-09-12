@@ -55,6 +55,12 @@ def require(cond, msg="assertion failed"):
 RESULT_KEYS = {"bi_rads", "acr", "verdict", "sub", "loc", "extra", "vicon", "confidence", "sms", "is_critical"}
 
 
+def is_real_source(source: str) -> bool:
+    """True for any non-simulated result — Roboflow, an offline HF/local model, or the offline
+    pixel-diff heuristic all count as 'real' here; only the SIMULATED scenario picker doesn't."""
+    return "SIMULATED" not in source
+
+
 def validate_result_shape(r, where):
     require(isinstance(r, dict), f"{where}: result is not a dict")
     missing = RESULT_KEYS - set(r.keys())
@@ -184,7 +190,7 @@ def _():
     r = inf.predict_tb(img)
     require(r is not None, "predict_tb returned None despite model being available")
     validate_result_shape(r, "predict_tb")
-    require("real inference" in r["source"], "TB result should be tagged as real inference")
+    require(is_real_source(r["source"]), f"TB result should be tagged as real, not simulated: {r['source']!r}")
 
 
 @check("Maternal real-model inference on a synthetic ultrasound")
@@ -194,7 +200,7 @@ def _():
     r = inf.predict_maternal(img)
     require(r is not None, "predict_maternal returned None despite model being available")
     validate_result_shape(r, "predict_maternal")
-    require("real inference" in r["source"], "Maternal result should be tagged as real inference")
+    require(is_real_source(r["source"]), f"Maternal result should be tagged as real, not simulated: {r['source']!r}")
 
 
 @check("Mammography: real Roboflow workflow if a key is configured, else SIMULATED")
@@ -207,7 +213,7 @@ def _():
         # answer for real, not fall through to local weights or return None.
         require(direct is not None, "predict_mammography returned None despite a Roboflow key being configured")
         validate_result_shape(direct, "predict_mammography(roboflow)")
-        require("real inference" in direct["source"], "expected a real-inference source with a key configured")
+        require(is_real_source(direct["source"]), f"expected a real (non-simulated) source with a key configured: {direct['source']!r}")
     elif not inf._find_local_mammo_weights():
         require(direct is None, "predict_mammography should return None with no key and no local weights")
 
@@ -314,10 +320,39 @@ def _first_image_for_category(coco_path, ds_dir, category_name):
     return imgs[0] if imgs else None
 
 
-@check("TB Roboflow model matches ground truth (positive + negative annotated samples)")
+@check("Offline pixel-diff heuristic: accuracy floor on held-out ground truth (TB + Mammography)")
 def _():
-    if not inf._roboflow_api_key():
-        return
+    """Guards against silent regressions in offline_cv.py itself — calls it directly (bypassing
+    the dispatcher's try-order) on a handful of held-out samples per modality and requires
+    better-than-chance accuracy. Not a substitute for `python offline_cv.py`'s fuller
+    calibration run — just a fast sanity floor for every-day validation."""
+    import offline_cv
+    from PIL import Image
+
+    for modality in ("tb", "mammography"):
+        if not offline_cv.available(modality):
+            continue  # no local dataset in this environment — nothing to check
+        cfg = offline_cv._DATASETS[modality]
+        pos, neg = offline_cv._collect_image_paths(
+            offline_cv._dataset_dir(modality), cfg["positive_categories"], cfg["negative_categories"])
+        test_marker = os.sep + "test" + os.sep
+        pos = [p for p in pos if test_marker in p][:5]
+        neg = [p for p in neg if test_marker in p][:5]
+        require(pos and neg, f"{modality}: not enough held-out test-split samples to check")
+        correct, total = 0, 0
+        for path, expect_positive in [(p, True) for p in pos] + [(p, False) for p in neg]:
+            r = offline_cv.predict(modality, Image.open(path))
+            require(r is not None, f"{modality}: offline_cv.predict returned None on {path}")
+            correct += r["is_critical"] == expect_positive
+            total += 1
+        print(f"    [{modality}] {correct}/{total} correct on this quick held-out sample")
+        require(correct >= total * 0.5, f"{modality}: offline heuristic at/below chance ({correct}/{total}) — likely broken, not just imprecise")
+
+
+@check("TB dispatcher matches ground truth (positive + negative annotated samples)")
+def _():
+    """Tests predict_tb() end-to-end — whichever method is actually primary right now (offline
+    heuristic, then Roboflow, then the offline HF model — see predict_tb() in inference.py)."""
     ds_dir = os.path.join(ROOT_DIR, "Models", "TB", "Data Set", "tuberculosis.coco", "test")
     ann_path = os.path.join(ds_dir, "_annotations.coco.json")
     require(os.path.isfile(ann_path), f"no COCO annotations found at {ann_path}")
