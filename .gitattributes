@@ -1,1 +1,6 @@
 *.pt filter=lfs diff=lfs merge=lfs -text
+
+# Force LF regardless of the committer's platform -- these run on Linux (RK3588 SBC / Buildozer's
+# Android build container) where a CRLF-corrupted shebang line breaks the script outright.
+*.sh text eol=lf
+*.service text eol=lf
