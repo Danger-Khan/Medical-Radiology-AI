@@ -1,0 +1,29 @@
+# Downloaded model weights — re-fetched automatically from Hugging Face/Roboflow at first run
+# (see inference.py), so they don't need to live in the repo.
+Models/*/*.pt
+Models/*/*.onnx
+Models/*/.cache/
+Models/*/*/.cache/
+
+# Local runtime artifacts
+pink_edge_cache.db
+Validation/validation_test_cache.db
+Misc/Pink_Edge_AI-main/Pink_Edge_AI-main/pink_edge_cache.db
+
+# Secrets — never commit these. Use Streamlit Cloud's Secrets manager or a local untracked file.
+roboflow_key.txt
+.streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Local tool config — not part of the project itself
+.claude/
+
+# OS / editor
+.DS_Store
+Thumbs.db
