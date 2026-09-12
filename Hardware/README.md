@@ -30,7 +30,8 @@ concrete.
 | [`WIRING.md`](WIRING.md) | Exact pin connections to actually build it |
 | [`DESIGN.md`](DESIGN.md) | Enclosure, power resilience, thermal, human factors for a real clinic deployment |
 | [`STRUCTURE.md`](STRUCTURE.md) | This folder's own layout, and how a multi-BHU fleet is organized |
-| [`diagrams/`](diagrams/) | The visual version of the above — architecture, wiring, and comparison diagrams |
+| [`diagrams/`](diagrams/) | The visual version of the above — architecture, wiring, and comparison diagrams (generated, schematic-accurate) |
+| [`IMAGE_PROMPTS.md`](IMAGE_PROMPTS.md) | Copy-paste prompts for an image-generating LLM — realistic/marketing-style renders, not technical diagrams |
 
 Start with `ALTERNATIVES.md` if you're deciding what to build, `WIRING.md`/`diagrams/` if you're
 building the pilot unit that's already been decided on.
