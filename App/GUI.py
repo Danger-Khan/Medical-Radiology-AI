@@ -76,6 +76,8 @@ TR = {
     "Telemetry Log": "ٹیلی میٹری لاگ", "Alert Stream": "الرٹ اسٹریم", "No reports cached": "کوئی رپورٹ کیش نہیں",
     "Local Cache Status": "لوکل کیش حالت", "Report cached.": "رپورٹ محفوظ ہو گئی۔",
     "Sync complete.": "سنک مکمل۔",
+    "Not triaged": "تشخیص نہیں ہوئی",
+    "wrong image type -- please re-upload the correct scan": "غلط تصویر کی قسم — براہ کرم درست اسکین دوبارہ اپ لوڈ کریں",
 }
 _urdu = {"on": False}
 
@@ -289,6 +291,22 @@ def draw_bbox(image, model_name, result):
     rgb = image.convert("RGB")
     draw = ImageDraw.Draw(rgb)
     w, h = rgb.size
+
+    if result and result.get("invalid_image"):
+        # Wrong kind of scan entirely (see inference.py's check_image_domain()) -- drawing any of
+        # the modality-specific overlays below would falsely imply a real region was localized.
+        try:
+            font = ImageFont.truetype("consola.ttf", 16)
+        except Exception:
+            font = ImageFont.load_default()
+        label = "\U0001F6AB Wrong image type -- not analyzed"
+        tb = draw.textbbox((0, 0), label, font=font)
+        tw, th = tb[2] - tb[0], tb[3] - tb[1]
+        lx, ly = max(10, (w - tw) // 2), max(10, (h - th) // 2)
+        draw.rectangle([lx - 10, ly - 8, lx + tw + 10, ly + th + 8], fill=(245, 158, 11))
+        draw.text((lx, ly), label, fill="white", font=font)
+        return rgb
+
     is_critical = bool(result and result.get("is_critical"))
     conf_str = f"{result['confidence']:.1f}%" if result else "94.2%"
     color = (236, 72, 153) if is_critical else (16, 185, 129)
@@ -778,7 +796,8 @@ class PinkEdgeApp:
 
         if self.inference_done and self.current_result:
             r = self.current_result
-            self.verdict_frame.configure(bg=C["danger"] if r["is_critical"] else C["success"])
+            invalid = bool(r.get("invalid_image"))
+            self.verdict_frame.configure(bg=C["warning"] if invalid else (C["danger"] if r["is_critical"] else C["success"]))
             for w in (self.verdict_icon, self.verdict_title, self.verdict_sub):
                 w.configure(bg=self.verdict_frame["bg"])
             self.verdict_icon.configure(text=r["vicon"])
@@ -789,7 +808,10 @@ class PinkEdgeApp:
                 f"Inference Time:  {self.inference_latency}s\nModel Source:  {r.get('source', 'N/A')}"))
             self.bi_rads_var.set(r["bi_rads"])
             self.acr_var.set(r["acr"])
-            if r["is_critical"]:
+            if invalid:
+                self.risk_banner.configure(text="🚫 Not triaged — wrong image type, please re-upload the correct scan",
+                                            fg="white", bg=C["warning"])
+            elif r["is_critical"]:
                 self.risk_banner.configure(text="⚠️ Immediate Action Required — refer for specialist consultation",
                                             fg="white", bg=C["danger"])
             else:

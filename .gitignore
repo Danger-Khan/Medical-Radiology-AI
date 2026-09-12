@@ -1,7 +1,10 @@
 # Downloaded model weights — re-fetched automatically from Hugging Face/Roboflow at first run
-# (see App/inference.py), so they don't need to live in the repo.
+# (see App/inference.py), so they don't need to live in the repo. local_model.pt (App/Models/*/*.pt
+# already covers it) is a bit different -- reproducibly retrained via App/train_local_model.py --
+# but its paired metadata.json is ignored too so the two never go out of sync in git.
 App/Models/*/*.pt
 App/Models/*/*.onnx
+App/Models/*/local_model_metadata.json
 App/Models/*/.cache/
 App/Models/*/*/.cache/
 
@@ -17,6 +20,16 @@ App/Misc/Pink_Edge_AI-main/Pink_Edge_AI-main/pink_edge_cache.db
 # Secrets — never commit these. Use Streamlit Cloud's Secrets manager or a local untracked file.
 roboflow_key.txt
 App/.streamlit/secrets.toml
+
+# Apk/ — Buildozer's own build cache/output (SDK/NDK downloads, compiled APKs) and the template
+# PNGs generate_assets.py derives from App/Models/*/Data Set/ (same "derived, don't commit" reasoning
+# as App/Models/*/templates/ above).
+Apk/.buildozer/
+Apk/bin/
+Apk/assets/*/positive.png
+Apk/assets/*/negative.png
+Apk/reports/
+Apk/_last_overlay.png
 
 # Python
 __pycache__/

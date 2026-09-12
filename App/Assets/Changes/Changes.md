@@ -175,3 +175,137 @@ logic per modality.
   enough at 512×512 that it doesn't matter in practice).
 - Hardware/network diagnostics stay illustrative (randomized), exactly as the original app's own
   admittedly-fake RK3588 stats were — not a regression, just carried forward.
+
+## Local Android APK scaffold (`Apk/`, repo root, sibling to `App/`)
+Added a from-scratch Kivy + Buildozer build, kept deliberately separate from `App/` rather than
+nested inside it — Android build output and `App/`'s own desktop/web code don't belong in the same
+tree. It is **not** a port of `GUI.py`/`streamlit_app.py`: `torch`/`transformers`/`ultralytics`/
+`opencv-python` have no dependable `python-for-android` recipes, so the mobile app is a separate
+two-tier dispatch (`mobile_inference.py`) using only `requests`/`numpy`/`Pillow`/`kivy`/`plyer`:
+- Tier 1: Roboflow hosted REST API, called directly over HTTPS (no `inference-sdk` — too heavy),
+  same model/workflow IDs as `App/inference.py`.
+- Tier 2: the offline pixel-diff heuristic, reimplemented with pure numpy/Pillow (no OpenCV) against
+  small template PNGs bundled into the APK by `generate_assets.py` (which reuses `App/offline_cv.py`'s
+  own `_get_templates()` on a desktop, so the two editions' offline heuristic stays derived from the
+  same reference images) instead of shipping the full multi-megabyte datasets.
+- Same measured-accuracy precedence as desktop: TB tries the offline heuristic first, Mammography
+  and Maternal try Roboflow first.
+- Not built into a real APK in this environment — no Android SDK/NDK here, and Buildozer requires
+  Linux (WSL2/VM). Written to Kivy + python-for-android's actual constraints, but unverified building
+  until run for real; see `Apk/README.md`'s honesty note.
+
+## RK3588 SBC deployment code (`RK3588 SBC/`, repo root)
+Turns the hardware plan in `App/Hardware/` into runnable code for the chosen edge-node board:
+- `install_rk3588.sh` + `pinkedge.service` — copies `App/` onto the board and autostarts `GUI.py` as
+  a kiosk app on boot via systemd, with restart-on-crash.
+- `uart_bridge.py` — the compute-subsystem side of the UART link to the ESP32/SIM800L companion from
+  `App/Hardware/WIRING.md` (Option A): watches a local queue file for alert lines and forwards them
+  over serial, with a `--dry-run` mode that needs no hardware. A one-time two-line addition to
+  `GUI.py` (documented in `RK3588 SBC/README.md`, not made automatically) is what actually queues
+  `sms_payload` for it to pick up.
+- `convert_to_rknn.py` (run on an x86 dev machine) + `rknn_infer.py` (run on the board) — converts an
+  ONNX-exported YOLOv8 mammography checkpoint to `.rknn` and runs it through the RK3588's NPU via
+  `rknn-toolkit-lite2`, the NPU follow-up `App/Hardware/ARCHITECTURE.md` flagged as not blocking a
+  first pilot. Neither has been run against a real converted model here — no RK3588 hardware and no
+  local trained mammography checkpoint are available in this environment to test with.
+
+## Manual positive/negative/validate folders per modality (`App/Models/*/{positive,negative,validate}/`)
+Each modality's `offline_cv.py` template no longer depends solely on the COCO-annotated dataset: new
+`positive/` and `negative/` folders let images be dropped in directly (no annotation step) and are
+folded into template-building automatically, with the on-disk template cache now invalidating itself
+whenever those folders' contents change (tracked via a small mtime signature in the cache's own
+`metadata.json`) instead of needing a manual cache-clear. A third `validate/` folder is a
+no-ground-truth spot-check: `python offline_cv.py` now also prints the heuristic's prediction for
+every image dropped there, after the main calibration numbers. `_get_templates()` also no longer
+requires the COCO dataset directory to exist at all — a modality with only manually-added images
+still gets a working template. Added `python offline_cv.py --gather [--count N]`: seeds any
+still-empty `positive`/`negative`/`validate` folder with real sample images pulled straight from
+that modality's own `Data Set` (never touching folders a user has already added to). `positive`/
+`negative` gathering is careful to pull only from the `train`/`valid` splits (never `test`), so it
+can never quietly leak held-out data into the template and inflate `calibrate()`'s accuracy numbers
+— `validate` gathering does the opposite on purpose, pulling only from the held-out `test` split,
+since genuinely-unseen images are exactly what a spot-check folder wants.
+
+## Locally-trained classifier per modality (`App/train_local_model.py`, `Models/*/local_model.pt`)
+In addition to Roboflow, the offline pixel-diff heuristic, and the downloaded Hugging Face models,
+each modality can now have a real classifier trained directly on this project's own data: a
+torchvision MobileNetV3-Small (ImageNet-pretrained backbone, frozen) with a linear head trained from
+scratch on `Models/<Modality>/Data Set/`'s `train`+`valid` splits (capped at 150 images/class, same
+budget as `offline_cv.py`'s templates) plus anything in `positive`/`negative/`, evaluated on that
+dataset's own held-out `test` split — never trained on, exactly like every other accuracy number in
+this project. Run `python train_local_model.py [modality ...]` to (re)train.
+
+**Measured, not assumed, before touching any precedence** (same convention as everywhere else in
+this project): trained and evaluated all three modalities, then only moved the new tier ahead of an
+existing one where it measurably won on the same held-out methodology:
+```
+tb:           82.5% (80 held-out samples)  -> beats offline heuristic's 74% -> now TB's tier #1
+mammography:  82.1% (78 held-out samples)  -> below offline heuristic's 96% -> stays after it
+maternal:     not trained -- dataset has zero negative images (same root cause as the offline
+              heuristic's Maternal gap); the script refuses to train on one-class-only data rather
+              than silently producing a model that always predicts positive
+```
+`inference.py`'s `predict_tb()`/`predict_mammography()`/`predict_maternal()` and `model_status()`
+updated accordingly; `local_model.pt` (already covered by the existing `Models/*/*.pt` gitignore
+rule) plus its paired `local_model_metadata.json` (architecture, image size, sample counts, measured
+accuracy, training date) are both gitignored — reproducible by re-running the script, not hand-edited
+state. Added a 20th validation check (`Locally-trained classifier: accuracy floor on held-out ground
+truth`) mirroring the existing offline-heuristic one.
+
+## ⚠️ Bug found and fixed: Mammography positive/negative folders were inverted
+While training the locally-trained classifier above, discovered that `Models/Mammography/positive/`
+and `negative/` (pre-populated by the user, independently of `offline_cv.py --gather`) used the
+**opposite** convention from every other piece of this project: 81 healthy ("normal (N)"-named)
+mammograms sitting in `positive/`, 156 cancer ("mdb###"-named) mammograms sitting in `negative/`.
+Every template/model trained from these folders before the fix — the offline heuristic's 96% and the
+locally-trained classifier's first 82.1% — was quietly built from mislabeled data. Fixed by swapping
+the two folders' contents (verified 100% homogeneous by filename pattern first — only each folder's
+own `README.md` wasn't part of the swap) to match the standard convention, then rebuilding
+everything that reads from them:
+```
+offline heuristic (python offline_cv.py):    96% (48/50) -> 98% (49/50)
+locally-trained classifier (retrained):       82.1% (64/78) -> 98.7% (77/78)
+```
+Both numbers *improved* once the mislabeling was fixed — exactly what should happen when training
+data stops being contaminated. Mammography's locally-trained classifier is now statistically tied
+with the offline heuristic (98.7% vs. 98%, not a real difference given the sample sizes) rather than
+measurably worse; `inference.py`'s comments and every doc citing the old 82.1%/96% figures updated.
+Saved as a standing memory (`mammography-positive-negative-convention`) so a future session
+double-checks this user's manually-sorted image folders rather than assuming standard convention.
+
+## Out-of-domain detection: reject the wrong kind of scan before triage
+Per request: "if the image is out of source ... try outputting like wrong image uploaded" for all
+three modalities. Fully offline, reuses `offline_cv.py`'s existing template infrastructure rather
+than adding a new method: `domain_score()` is the best-orientation normalized cross-correlation
+between the uploaded image and the modality's own generic reference image (average of whichever of
+the positive/negative templates exist — doesn't require both, unlike full triage); below a
+per-modality `DOMAIN_THRESHOLDS` cutoff, `is_out_of_domain()` flags it. `inference.py`'s new
+`check_image_domain()` runs this as the very first step of `predict_tb()`/`predict_mammography()`/
+`predict_maternal()` — before any tier, including Roboflow (so an obviously-wrong upload doesn't
+cost an API call) — and returns a distinct "Wrong Image Type" result (`invalid_image: True` in the
+result dict) instead of a triage verdict.
+
+**Measured, not assumed** (`calibrate_domain()` in `offline_cv.py`, each modality's own held-out
+test-split images vs. the other two modalities' as a "wrong kind of scan" stand-in):
+```
+tb:           threshold 0.47 -> 95% real scans pass, 97.5% wrong-modality images caught
+maternal:     threshold 0.37 -> 80% real scans pass, 82.5% wrong-modality images caught
+mammography:  threshold 0.03 -> 90% real scans pass, only 37.5% wrong-modality images caught
+```
+Mammography's threshold is deliberately lenient (biased toward never blocking a real mammogram)
+because its scans vary too much in crop/zoom for this method to separate as cleanly as TB's more
+standardized X-rays — documented honestly rather than hidden, same as the TB Roboflow issue above.
+Verified separately that a genuinely unrelated image (random noise, a solid color) scores ~0 against
+every modality's reference, reliably below every threshold — the hard cross-modality numbers above
+likely understate real-world performance against an actually-wrong upload (a photo, a document).
+
+UI: `GUI.py`'s `draw_bbox()` now special-cases `invalid_image` results with a plain "Wrong image
+type — not analyzed" banner instead of drawing a modality-specific overlay that would falsely imply
+a real region was localized; both `GUI.py` and `streamlit_app.py`'s verdict panels gained a third
+(amber, `C["warning"]`) visual state alongside the existing danger/success ones, with matching
+risk-banner text. Added a 21st validation check (`Out-of-domain gate: wrong image type rejected,
+real scans pass through`) using random noise as the "wrong image" case (reliable across all three
+modalities, unlike the imperfect cross-modality separation) and checking several real samples with a
+majority-pass threshold rather than one sample with a must-always-pass assertion, since the gate is
+a measured, imperfect heuristic (mammography especially) — not something a single unlucky sample
+should be able to fail the whole suite over.

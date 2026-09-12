@@ -21,11 +21,18 @@ substitute for the trained models. It exists as a dependency-light, always-avail
 tier: see CALIBRATION.md-equivalent notes below and Documentations/MODEL_SOURCES.md for measured
 accuracy against held-out samples from the same datasets — be honest with yourself about what
 those numbers mean before trusting this over the real models.
+
+Besides the COCO-annotated datasets, each modality also has Models/<Modality>/positive/,
+negative/, and validate/ folders (see their own README.md) for manually dropping in extra images
+with no annotation step required — positive/negative feed straight into template-building
+alongside the labeled dataset (cache auto-invalidates when those folders change), validate/ is a
+no-ground-truth spot-check folder reported by `python offline_cv.py`.
 """
 import json
 import math
 import os
 import random
+import shutil
 
 import numpy as np
 from PIL import Image
@@ -56,11 +63,40 @@ _DATASETS = {
 }
 
 _TEMPLATE_CACHE = {}  # modality -> (positive_template, negative_template) | (None, None)
+_MANUAL_IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".bmp")
 
 
 def _dataset_dir(modality):
     cfg = _DATASETS[modality]
     return os.path.join(MODELS_DIR, cfg["models_subdir"], "Data Set", cfg["dataset_dir_name"])
+
+
+def _modality_dir(modality):
+    return os.path.join(MODELS_DIR, _DATASETS[modality]["models_subdir"])
+
+
+def _manual_image_paths(modality, sub):
+    """Images a user drops directly into Models/<Modality>/positive|negative|validate/ — no COCO
+    annotation needed, picked up automatically alongside the labeled dataset. `sub` is "positive",
+    "negative", or "validate"."""
+    d = os.path.join(_modality_dir(modality), sub)
+    if not os.path.isdir(d):
+        return []
+    return sorted(os.path.join(d, f) for f in os.listdir(d) if f.lower().endswith(_MANUAL_IMAGE_EXTS))
+
+
+def _manual_signature(modality):
+    """Cheap on-disk-cache invalidation: (filename, mtime) pairs for every manually-added
+    positive/negative image, so dropping a new file into those folders triggers a template rebuild
+    on the next call instead of silently using a stale cached template forever."""
+    sig = []
+    for sub in ("positive", "negative"):
+        for p in _manual_image_paths(modality, sub):
+            try:
+                sig.append([os.path.relpath(p, MODELS_DIR), os.path.getmtime(p)])
+            except OSError:
+                continue
+    return sorted(sig)
 
 
 def _load_coco_splits(dataset_dir):
@@ -126,48 +162,76 @@ def _build_template(image_paths, seed):
 
 def _get_templates(modality, exclude_split=None, use_cache=True):
     """`exclude_split` bypasses the on-disk cache (used only by calibrate() for a proper
-    train/test split — normal predict calls always use the cached, all-data templates)."""
-    if use_cache and modality in _TEMPLATE_CACHE:
-        return _TEMPLATE_CACHE[modality]
+    train/test split — normal predict calls always use the cached, all-data templates).
 
+    Positive/negative images placed directly in Models/<Modality>/positive|negative/ (no COCO
+    annotation needed — see that folder's own README.md) are folded in alongside the labeled
+    dataset every time templates are (re)built, and their mtimes are checked against the cache on
+    every call so dropping in a new image triggers a rebuild rather than silently going unused."""
     cfg = _DATASETS.get(modality)
     if cfg is None:
         return None, None
+    manual_sig = _manual_signature(modality)
+
+    if use_cache and modality in _TEMPLATE_CACHE:
+        cached_pos, cached_neg, cached_sig = _TEMPLATE_CACHE[modality]
+        if cached_sig == manual_sig:
+            return cached_pos, cached_neg
+
     tpl_dir = os.path.join(MODELS_DIR, cfg["models_subdir"], "templates")
     pos_path, neg_path = os.path.join(tpl_dir, "positive.png"), os.path.join(tpl_dir, "negative.png")
+    meta_path = os.path.join(tpl_dir, "metadata.json")
 
     if use_cache and os.path.isfile(pos_path) and os.path.isfile(neg_path):
-        result = (np.asarray(Image.open(pos_path).convert("L")), np.asarray(Image.open(neg_path).convert("L")))
-        _TEMPLATE_CACHE[modality] = result
-        return result
+        cached_meta_sig = None
+        if os.path.isfile(meta_path):
+            try:
+                with open(meta_path, "r", encoding="utf-8") as fh:
+                    cached_meta_sig = json.load(fh).get("manual_signature")
+            except (OSError, json.JSONDecodeError):
+                pass
+        if cached_meta_sig == manual_sig:
+            result = (np.asarray(Image.open(pos_path).convert("L")), np.asarray(Image.open(neg_path).convert("L")))
+            _TEMPLATE_CACHE[modality] = (result[0], result[1], manual_sig)
+            return result
+        # Manual folders changed since this cache was written -- fall through and rebuild.
 
     dataset_dir = _dataset_dir(modality)
-    if not os.path.isdir(dataset_dir):
-        if use_cache:
-            _TEMPLATE_CACHE[modality] = (None, None)
-        return None, None
+    pos_paths, neg_paths = set(), set()
+    if os.path.isdir(dataset_dir):
+        coco_pos, coco_neg = _collect_image_paths(
+            dataset_dir, cfg["positive_categories"], cfg["negative_categories"], exclude_split=exclude_split)
+        pos_paths.update(coco_pos)
+        neg_paths.update(coco_neg)
+    pos_paths.update(_manual_image_paths(modality, "positive"))
+    neg_paths.update(_manual_image_paths(modality, "negative"))
+    pos_paths, neg_paths = sorted(pos_paths), sorted(neg_paths)
 
-    pos_paths, neg_paths = _collect_image_paths(
-        dataset_dir, cfg["positive_categories"], cfg["negative_categories"], exclude_split=exclude_split)
-    pos_tpl, neg_tpl = _build_template(pos_paths, seed=1), _build_template(neg_paths, seed=2)
+    pos_tpl = _build_template(pos_paths, seed=1) if pos_paths else None
+    neg_tpl = _build_template(neg_paths, seed=2) if neg_paths else None
 
     if use_cache and pos_tpl is not None and neg_tpl is not None:
         os.makedirs(tpl_dir, exist_ok=True)
         Image.fromarray(pos_tpl).save(pos_path)
         Image.fromarray(neg_tpl).save(neg_path)
-        with open(os.path.join(tpl_dir, "metadata.json"), "w", encoding="utf-8") as fh:
+        with open(meta_path, "w", encoding="utf-8") as fh:
             json.dump({
                 "positive_samples_available": len(pos_paths), "negative_samples_available": len(neg_paths),
                 "positive_samples_used": min(len(pos_paths), MAX_TEMPLATE_SAMPLES),
                 "negative_samples_used": min(len(neg_paths), MAX_TEMPLATE_SAMPLES),
+                "manual_signature": manual_sig,
             }, fh, indent=2)
 
     if use_cache:
-        _TEMPLATE_CACHE[modality] = (pos_tpl, neg_tpl)
+        _TEMPLATE_CACHE[modality] = (pos_tpl, neg_tpl, manual_sig)
     return pos_tpl, neg_tpl
 
 
 def _best_orientation(gray, reference):
+    """Returns (best_image, orientation_name, correlation_score) — the score (normalized
+    cross-correlation, roughly -1..1) also doubles as a cheap "does this even look like the right
+    kind of scan at all" signal, independent of orientation — see domain_score()/
+    is_out_of_domain() below."""
     ref = reference.astype(np.float64)
     ref_c = ref - ref.mean()
     ref_norm = np.linalg.norm(ref_c) or 1.0
@@ -178,7 +242,7 @@ def _best_orientation(gray, reference):
         score = float(np.sum(ref_c * c_c) / (ref_norm * (np.linalg.norm(c_c) or 1.0)))
         if score > best_score:
             best_img, best_name, best_score = cand, name, score
-    return best_img, best_name
+    return best_img, best_name, best_score
 
 
 def _analyze(modality, pil_image, positive_tpl, negative_tpl):
@@ -187,7 +251,7 @@ def _analyze(modality, pil_image, positive_tpl, negative_tpl):
 
     gray = _preprocess_canonical(pil_image)
     generic_ref = ((positive_tpl.astype(np.float64) + negative_tpl.astype(np.float64)) / 2).astype(np.uint8)
-    gray, orientation = _best_orientation(gray, generic_ref)
+    gray, orientation, _ = _best_orientation(gray, generic_ref)
 
     diff_pos = np.abs(gray.astype(np.float64) - positive_tpl.astype(np.float64))
     diff_neg = np.abs(gray.astype(np.float64) - negative_tpl.astype(np.float64))
@@ -211,6 +275,63 @@ def _analyze(modality, pil_image, positive_tpl, negative_tpl):
 
 def _confidence(change_score):
     return 100.0 / (1.0 + math.exp(-change_score / CONFIDENCE_SCALE))
+
+
+# ============================================================
+# OUT-OF-DOMAIN DETECTION — "does this even look like the right kind of scan at all", checked
+# BEFORE running any real triage tier (see inference.py's predict_tb/mammography/maternal). Fully
+# offline, reuses the same templates/correlation machinery as the triage heuristic above rather
+# than adding a new dependency: a real chest X-ray correlates reasonably well with the TB generic
+# reference even when it disagrees on diagnosis; a photo of a cat or a document does not correlate
+# well with ANY of the three modalities' references. See DOMAIN_THRESHOLDS' comment for how the
+# per-modality cutoffs below were picked, and calibrate_domain() to re-measure them yourself.
+# ============================================================
+DOMAIN_THRESHOLDS = {
+    # Picked via calibrate_domain() (run `python offline_cv.py` to reproduce): each modality's own
+    # held-out test-split images vs. the OTHER two modalities' held-out test-split images used as
+    # a deliberately HARD "wrong kind of scan" stand-in (another real medical grayscale image, not
+    # an easy case like a random color photo) — see Documentations/MODEL_SOURCES.md for the full
+    # measured score distributions and why mammography's threshold is biased toward never blocking
+    # a real mammogram rather than maximizing catch rate (its scans vary too much in crop/zoom for
+    # this pixel-correlation method to separate as cleanly as TB's more standardized X-rays do).
+    "tb": 0.47,          # measured: 95% real TB scans pass, 97% wrong-modality images caught
+    "maternal": 0.37,    # measured: 80% real ultrasounds pass, 82% wrong-modality images caught
+    "mammography": 0.03,  # measured: 90% real mammograms pass, only ~33% wrong-modality images
+                           # caught at this lenient setting — see MODEL_SOURCES.md before relying on it
+}
+
+
+def _generic_reference(modality):
+    """Whichever of the positive/negative templates exist, averaged — a "what does this modality's
+    scan look like at all" reference for domain checking, independent of _get_templates()'s
+    requirement that BOTH classes exist (out-of-domain detection only needs "some reference",
+    not a full positive/negative split — useful for e.g. Maternal, which has no negative class)."""
+    pos, neg = _get_templates(modality)
+    if pos is not None and neg is not None:
+        return ((pos.astype(np.float64) + neg.astype(np.float64)) / 2).astype(np.uint8)
+    return pos if pos is not None else neg
+
+
+def domain_score(modality, pil_image):
+    """Best-orientation normalized cross-correlation against modality's generic reference image
+    (roughly -1..1, higher = looks more like this modality's scans). Returns None if no reference
+    is available at all (no dataset and nothing manually added for this modality)."""
+    reference = _generic_reference(modality)
+    if reference is None:
+        return None
+    gray = _preprocess_canonical(pil_image)
+    _, _, score = _best_orientation(gray, reference)
+    return score
+
+
+def is_out_of_domain(modality, pil_image):
+    """True if `pil_image` doesn't look like the right kind of scan for `modality` at all. False
+    (never flags anything) if no reference exists yet to compare against — an unavailable check
+    should never block triage, it should just not run."""
+    score = domain_score(modality, pil_image)
+    if score is None:
+        return False, None
+    return score < DOMAIN_THRESHOLDS.get(modality, 0.3), score
 
 
 _MODALITY_VOCAB = {
@@ -339,7 +460,157 @@ def calibrate(modality: str, max_per_class=25):
           f"overall: {total_c}/{total_n} ({100 * total_c / total_n:.0f}%)")
 
 
+def _test_split_images(modality, limit=15, seed=0):
+    """Held-out test-split image paths for `modality`, regardless of category (used by
+    calibrate_domain() as "definitely a real X" / "definitely NOT an X" stand-ins)."""
+    cfg = _DATASETS.get(modality)
+    if cfg is None:
+        return []
+    dataset_dir = _dataset_dir(modality)
+    if not os.path.isdir(dataset_dir):
+        return []
+    pos, neg = _collect_image_paths(dataset_dir, cfg["positive_categories"], cfg["negative_categories"], exclude_split=None)
+    test_marker = os.sep + "test" + os.sep
+    all_test = sorted({p for p in (pos + neg) if test_marker in p})
+    if len(all_test) > limit:
+        all_test = random.Random(seed).sample(all_test, limit)
+    return all_test
+
+
+def calibrate_domain(modality, samples_per_class=15):
+    """Measures how well domain_score() separates real in-domain images (this modality's own
+    held-out test split) from out-of-domain images (the OTHER two modalities' held-out test
+    splits, used as "definitely the wrong kind of scan" stand-ins — a chest X-ray fed to the
+    Mammography check, etc.) — prints the score distributions so DOMAIN_THRESHOLDS above is a
+    measured pick, not a guess. Run via `python offline_cv.py`."""
+    in_domain_paths = _test_split_images(modality, limit=samples_per_class)
+    if not in_domain_paths:
+        print(f"  [{modality}] no test-split images available, skipping domain calibration")
+        return
+    out_domain_paths = []
+    for other in _DATASETS:
+        if other != modality:
+            out_domain_paths += _test_split_images(other, limit=samples_per_class)
+    if not out_domain_paths:
+        print(f"  [{modality}] no other-modality images available for comparison, skipping")
+        return
+
+    in_scores = [domain_score(modality, Image.open(p)) for p in in_domain_paths]
+    out_scores = [domain_score(modality, Image.open(p)) for p in out_domain_paths]
+    threshold = DOMAIN_THRESHOLDS.get(modality, 0.3)
+    in_pass = sum(s >= threshold for s in in_scores)
+    out_caught = sum(s < threshold for s in out_scores)
+    print(f"  [{modality}] in-domain (n={len(in_scores)}): min={min(in_scores):.2f} "
+          f"mean={sum(in_scores) / len(in_scores):.2f} max={max(in_scores):.2f} -- "
+          f"{in_pass}/{len(in_scores)} correctly pass threshold {threshold}")
+    print(f"  [{modality}] out-of-domain (n={len(out_scores)}): min={min(out_scores):.2f} "
+          f"mean={sum(out_scores) / len(out_scores):.2f} max={max(out_scores):.2f} -- "
+          f"{out_caught}/{len(out_scores)} correctly caught below threshold {threshold}")
+
+
+def gather_from_dataset(modality, target, count=15, seed=0):
+    """Copies real images from the modality's own Data Set into Models/<Modality>/<target>/
+    (target: "positive", "negative", or "validate") -- so those folders can hold actual files to
+    look at/build on instead of staying empty, without requiring anyone to hunt down extra images
+    by hand. "positive"/"negative" pull only from the dataset's train/valid splits (never `test`)
+    so gathering samples can never quietly leak held-out data into the template and inflate
+    calibrate()'s accuracy numbers; "validate" pulls specifically FROM the held-out `test` split
+    instead (genuinely unseen-by-the-template images are exactly what a spot-check folder wants).
+    Only ever adds files that aren't already present (by filename) -- never overwrites or
+    duplicates anything a user has dropped in themselves. See __main__'s `--gather` flag."""
+    cfg = _DATASETS.get(modality)
+    if cfg is None:
+        return []
+    dataset_dir = _dataset_dir(modality)
+    if not os.path.isdir(dataset_dir):
+        return []
+
+    if target in ("positive", "negative"):
+        pos_paths, neg_paths = _collect_image_paths(
+            dataset_dir, cfg["positive_categories"], cfg["negative_categories"], exclude_split="test")
+        candidates = pos_paths if target == "positive" else neg_paths
+    else:  # validate -- draw only from the held-out test split, no label needed either way
+        pos_paths, neg_paths = _collect_image_paths(
+            dataset_dir, cfg["positive_categories"], cfg["negative_categories"], exclude_split=None)
+        train_valid_pos, train_valid_neg = _collect_image_paths(
+            dataset_dir, cfg["positive_categories"], cfg["negative_categories"], exclude_split="test")
+        test_only = (set(pos_paths) | set(neg_paths)) - set(train_valid_pos) - set(train_valid_neg)
+        candidates = sorted(test_only)
+    if not candidates:
+        return []
+
+    rng = random.Random(seed)
+    sample = candidates if len(candidates) <= count else rng.sample(candidates, count)
+
+    out_dir = os.path.join(_modality_dir(modality), target)
+    os.makedirs(out_dir, exist_ok=True)
+    copied = []
+    for src in sample:
+        dst = os.path.join(out_dir, os.path.basename(src))
+        if os.path.exists(dst):
+            continue
+        try:
+            shutil.copy2(src, dst)
+            copied.append(dst)
+        except OSError:
+            continue
+    return copied
+
+
+def check_validate_folder(modality):
+    """Runs predict() against every image dropped into Models/<Modality>/validate/ and prints the
+    verdict for manual eyeballing. Unlike calibrate(), these images carry no ground-truth label
+    (that's the point — it's for "I found some extra images, what does the heuristic say about
+    them" spot-checks, not a formal accuracy measurement), so this reports predictions, not a score."""
+    paths = _manual_image_paths(modality, "validate")
+    if not paths:
+        return
+    print(f"  [{modality}] validate/ spot-check ({len(paths)} image(s), no ground truth — "
+          f"predictions only):")
+    for p in paths:
+        try:
+            result = predict(modality, Image.open(p))
+        except Exception as exc:
+            print(f"    {os.path.basename(p)}: ERROR ({exc})")
+            continue
+        if result is None:
+            print(f"    {os.path.basename(p)}: no templates available")
+        else:
+            print(f"    {os.path.basename(p)}: {result['verdict']} ({result['confidence']:.1f}%)")
+
+
 if __name__ == "__main__":
+    import sys
+
+    if "--gather" in sys.argv:
+        count = 15
+        if "--count" in sys.argv:
+            idx = sys.argv.index("--count")
+            if idx + 1 < len(sys.argv) and sys.argv[idx + 1].isdigit():
+                count = int(sys.argv[idx + 1])
+        print(f"Gathering up to {count} real sample(s) from each modality's own Data Set, into "
+              f"positive/negative/validate/ folders that are still empty (leaves anything you've "
+              f"already added there alone):")
+        for m in _DATASETS:
+            for target in ("positive", "negative", "validate"):
+                if _manual_image_paths(m, target):
+                    print(f"  [{m}/{target}] already has files — leaving as-is")
+                    continue
+                copied = gather_from_dataset(m, target, count=count)
+                print(f"  [{m}/{target}] gathered {len(copied)} sample(s) from Data Set"
+                      if copied else f"  [{m}/{target}] nothing to gather (no Data Set found)")
+        print("\nRe-run without --gather to see updated calibration/spot-check numbers.")
+        raise SystemExit(0)
+
     print("Offline CV heuristic — calibration against held-out test-split data (not used at runtime):")
+    print("(tip: `python offline_cv.py --gather` seeds empty positive/negative/validate/ folders "
+          "with real sample images pulled from each modality's own Data Set)")
     for m in _DATASETS:
         calibrate(m)
+    print("\nOut-of-domain detection calibration (does DOMAIN_THRESHOLDS actually separate "
+          "real scans from the other two modalities' images?):")
+    for m in _DATASETS:
+        calibrate_domain(m)
+    print("\nManual validate/ folder spot-checks (drop extra images into Models/<Modality>/validate/):")
+    for m in _DATASETS:
+        check_validate_folder(m)

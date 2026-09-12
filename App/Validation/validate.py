@@ -2,12 +2,15 @@
 """
 Pink Edge AI (Desktop) — validation suite.
 ============================================
-Self-contained smoke/validation test for GUI.py + inference.py + streamlit_app.py — 18 checks:
+Self-contained smoke/validation test for GUI.py + inference.py + streamlit_app.py — 21 checks:
 imports, imaging, simulated scenario generators, SQLite cache round-trip, text/PDF report
 generation, real model inference for all three modalities on both synthetic AND real Test Data/
-images (each modality tries its Roboflow-hosted model first, then an offline Hugging Face/
-local-weights fallback, then SIMULATED — see inference.py), ground-truth cross-checks against each
-modality's real COCO-annotated dataset, the run_triage() dispatcher, and two full feature sweeps —
+images (each modality tries several real-inference tiers in an order set by measured accuracy —
+Roboflow, the offline pixel-diff heuristic, a locally-trained classifier, an offline Hugging
+Face/local-weights fallback — before SIMULATED; see inference.py), ground-truth cross-checks
+against each modality's real COCO-annotated dataset, accuracy floors for both the offline
+pixel-diff heuristic and the locally-trained classifier, the run_triage() dispatcher, and two full
+feature sweeps —
 Tkinter (hidden window, no mainloop: every modality driven with a real Test Data image, overlay
 toggle, save-to-cache, text/PDF report download, language toggle, network mode + cloud sync + OTA,
 Hospital Hub, Cloud Sync, Reset Session) and Streamlit (AppTest, no browser: every modality, model
@@ -347,6 +350,82 @@ def _():
             total += 1
         print(f"    [{modality}] {correct}/{total} correct on this quick held-out sample")
         require(correct >= total * 0.5, f"{modality}: offline heuristic at/below chance ({correct}/{total}) — likely broken, not just imprecise")
+
+
+@check("Locally-trained classifier: accuracy floor on held-out ground truth (TB + Mammography)")
+def _():
+    """Same guard-rail as the offline_cv.py check above, for Models/<Modality>/local_model.pt
+    (produced by ../train_local_model.py) — calls it directly, bypassing the dispatcher's
+    try-order, so a regression in the model file itself can't hide behind another tier still
+    working. Skipped entirely if that file hasn't been trained yet (it's an optional tier)."""
+    import inference as _inf
+    from PIL import Image
+
+    for modality in ("tb", "mammography"):
+        if not _inf.local_model_available(modality):
+            continue  # not trained in this environment — nothing to check
+        import offline_cv
+
+        cfg = offline_cv._DATASETS[modality]
+        pos, neg = offline_cv._collect_image_paths(
+            offline_cv._dataset_dir(modality), cfg["positive_categories"], cfg["negative_categories"])
+        test_marker = os.sep + "test" + os.sep
+        pos = [p for p in pos if test_marker in p][:5]
+        neg = [p for p in neg if test_marker in p][:5]
+        require(pos and neg, f"{modality}: not enough held-out test-split samples to check")
+        correct, total = 0, 0
+        for path, expect_positive in [(p, True) for p in pos] + [(p, False) for p in neg]:
+            r = _inf._predict_local_trained(modality, Image.open(path))
+            require(r is not None, f"{modality}: local model returned None on {path}")
+            correct += r["is_critical"] == expect_positive
+            total += 1
+        print(f"    [{modality}] local_model.pt: {correct}/{total} correct on this quick held-out sample")
+        require(correct >= total * 0.5,
+                f"{modality}: local_model.pt at/below chance ({correct}/{total}) — likely broken, not just imprecise")
+
+
+@check("Out-of-domain gate: wrong image type rejected, real scans pass through")
+def _():
+    """inference.py's check_image_domain() (offline_cv.py's domain_score(), see
+    DOMAIN_THRESHOLDS) should reject an obviously-wrong image before any real triage tier runs,
+    for all three modalities -- and, just as important, must NOT falsely reject a real sample scan
+    for its own correct modality. Uses random noise as the "wrong image" case rather than another
+    modality's real scan: measured separation between modalities is imperfect (mammography
+    especially, see MODEL_SOURCES.md), but noise scores ~0 against every modality's reference,
+    reliably below every threshold -- see the measurement in Assets/Changes/Changes.md."""
+    import numpy as np
+    from PIL import Image
+
+    rng = np.random.default_rng(0)
+    noise = Image.fromarray(rng.integers(0, 255, (256, 256, 3), dtype=np.uint8))
+
+    for modality, predict_fn, folder in (
+        ("tb", inf.predict_tb, "Tuberculosis"),
+        ("mammography", inf.predict_mammography, "Breast Cancer"),
+        ("maternal", inf.predict_maternal, "Maternal"),
+    ):
+        r_noise = predict_fn(noise)
+        require(r_noise is not None, f"{modality}: predict returned None on a noise image")
+        require(r_noise.get("invalid_image") is True,
+                f"{modality}: random noise was NOT flagged as an invalid image (result: {r_noise['verdict']!r})")
+        validate_result_shape(r_noise, f"{modality} (invalid-image result)")
+
+        # Checked against several real samples, not just one, and required to mostly pass rather
+        # than always pass: the domain check is a measured, imperfect heuristic (mammography's
+        # in-domain pass rate is ~90%, maternal's ~80%, see MODEL_SOURCES.md) -- asserting every
+        # single real sample must pass would make this check flaky on whichever sample happens to
+        # be the unlucky one, while still catching a genuine regression (the gate rejecting
+        # most/all real scans). Below 3 samples (Maternal has exactly 1 in Test Data/) there isn't
+        # enough evidence to assert against a heuristic with a known <100% pass rate -- report only.
+        real_files = sorted(glob(os.path.join(TEST_DATA_DIR, folder, "*")))[:5]
+        passed = sum(not predict_fn(Image.open(p)).get("invalid_image") for p in real_files)
+        if len(real_files) >= 3:
+            require(passed >= len(real_files) // 2,
+                    f"{modality}: only {passed}/{len(real_files)} real sample scans passed the domain "
+                    f"gate -- likely broken, not just imprecise")
+        print(f"    [{modality}] noise correctly rejected"
+              + (f", {passed}/{len(real_files)} real sample(s) passed through"
+                 f"{' (too few to gate on)' if 0 < len(real_files) < 3 else ''}" if real_files else ""))
 
 
 @check("TB dispatcher matches ground truth (positive + negative annotated samples)")

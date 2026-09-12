@@ -166,6 +166,133 @@ def _top_box(predictions: list):
 
 
 # ============================================================
+# OUT-OF-DOMAIN GATE — checked before any real inference tier runs (and before any Roboflow API
+# call, so an obviously-wrong upload doesn't cost a network round-trip). Fully offline; see
+# offline_cv.py's domain_score()/is_out_of_domain()/DOMAIN_THRESHOLDS for the actual method and
+# Documentations/MODEL_SOURCES.md for the measured catch rate per modality (mammography's is
+# deliberately lenient — see that file before assuming this always catches a wrong upload).
+# ============================================================
+_EXPECTED_IMAGE_DESC = {
+    "tb": "a chest X-ray", "mammography": "a mammogram (breast X-ray)",
+    "maternal": "a fetal/obstetric ultrasound",
+}
+
+
+def _invalid_image_result(modality: str, score) -> dict:
+    desc = _EXPECTED_IMAGE_DESC.get(modality, "the expected scan type")
+    threshold = None
+    try:
+        import offline_cv
+
+        threshold = offline_cv.DOMAIN_THRESHOLDS.get(modality)
+    except Exception:
+        pass
+    confidence = 60.0 if (score is None or threshold is None) else \
+        float(min(99.0, max(50.0, 50 + (threshold - score) * 100)))
+    return {
+        "bi_rads": "N/A - Invalid Image", "acr": "N/A", "verdict": "Wrong Image Type",
+        "sub": f"This doesn't look like {desc} — please upload the correct type of scan.",
+        "css": "warning", "loc": "N/A", "extra": "Invalid image — not triaged", "vicon": "🚫",
+        "confidence": confidence, "sms": "INVALID", "is_critical": False,
+        "source": "Input validation (offline_cv.py domain check, no internet, no model)",
+        "invalid_image": True,
+    }
+
+
+def check_image_domain(modality: str, pil_image: Image.Image):
+    """Returns an invalid-image result dict if `pil_image` doesn't look like the right kind of
+    scan for `modality`, else None. Fails open (returns None) on any error — a broken domain
+    check must never block real triage, only an active, working check should."""
+    try:
+        import offline_cv
+
+        out_of_domain, score = offline_cv.is_out_of_domain(modality, pil_image)
+    except Exception:
+        return None
+    return _invalid_image_result(modality, score) if out_of_domain else None
+
+
+# ============================================================
+# LOCALLY-TRAINED CLASSIFIER — Models/<Modality>/local_model.pt, produced by
+# ../train_local_model.py: a MobileNetV3-Small (ImageNet-pretrained backbone, frozen) with a
+# linear head trained on this project's own dataset (Models/<Modality>/Data Set/ + any images
+# manually dropped into positive/negative/ — see offline_cv.py). Not present until
+# `python train_local_model.py` has actually been run; predict_*() below treats a missing file as
+# "this tier isn't available yet", same as every other optional tier.
+# ============================================================
+_local_models = {}       # modality -> (torch.nn.Module, metadata dict)
+_local_model_errors = {}
+
+
+def load_local_model(modality):
+    if modality in _local_models:
+        return _local_models[modality]
+    if modality in _local_model_errors:
+        return None, None
+    try:
+        import json as _json
+
+        import offline_cv
+        import torch
+        import torch.nn as nn
+        from torchvision import models
+
+        subdir = offline_cv._DATASETS[modality]["models_subdir"]
+        weights_path = os.path.join(MODELS_DIR, subdir, "local_model.pt")
+        meta_path = os.path.join(MODELS_DIR, subdir, "local_model_metadata.json")
+        if not (os.path.isfile(weights_path) and os.path.isfile(meta_path)):
+            _local_model_errors[modality] = "local_model.pt not found — run train_local_model.py"
+            return None, None
+        with open(meta_path, "r", encoding="utf-8") as fh:
+            meta = _json.load(fh)
+
+        net = models.mobilenet_v3_small(weights=None)
+        net.classifier[-1] = nn.Linear(net.classifier[-1].in_features, 2)
+        net.load_state_dict(torch.load(weights_path, map_location="cpu"))
+        net.eval()
+        _local_models[modality] = (net, meta)
+        return net, meta
+    except Exception as e:
+        _local_model_errors[modality] = str(e)
+        return None, None
+
+
+def local_model_available(modality) -> bool:
+    return load_local_model(modality)[0] is not None
+
+
+def _predict_local_trained(modality, pil_image: Image.Image):
+    """Runs Models/<Modality>/local_model.pt on `pil_image` and reuses offline_cv.py's own
+    per-modality result vocabulary (bi_rads/acr/tb-severity wording, sms codes, etc.) so this
+    tier's output looks exactly like every other tier's, just with a different `source`/`sub`."""
+    net, meta = load_local_model(modality)
+    if net is None:
+        return None
+    import torch
+    from torchvision import transforms
+
+    import offline_cv
+
+    img_size = meta.get("img_size", 128)
+    tf = transforms.Compose([
+        transforms.Resize((img_size, img_size)), transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+    ])
+    tensor = tf(pil_image.convert("RGB")).unsqueeze(0)
+    with torch.no_grad():
+        probs = torch.softmax(net(tensor), dim=1)[0].numpy()
+    is_positive = bool(probs[1] >= probs[0])
+    confidence = float(probs[1] if is_positive else probs[0]) * 100.0
+
+    result = offline_cv._to_result(modality, confidence, is_positive, bbox=None)
+    acc = meta.get("held_out_test_accuracy_pct")
+    acc_note = f", {acc:.1f}% held-out test accuracy" if acc is not None else ""
+    result["sub"] = f"Locally-trained classifier (MobileNetV3, trained on this project's own dataset{acc_note})"
+    result["source"] = f"local_model.pt (trained locally via train_local_model.py{acc_note})"
+    return result
+
+
+# ============================================================
 # TUBERCULOSIS — sukhmani1303/tuberculosis-vit-model (TorchScript ViT, Apache-2.0)
 # https://huggingface.co/sukhmani1303/tuberculosis-vit-model
 # ============================================================
@@ -287,10 +414,21 @@ def _predict_tb_roboflow(pil_image: Image.Image) -> dict:
 
 
 def predict_tb(pil_image: Image.Image) -> dict:
-    # Measured against 50 held-out ground-truth samples (see calibrate() in offline_cv.py /
-    # Documentations/MODEL_SOURCES.md): offline heuristic 74% > offline HF ViT 62% > Roboflow
-    # model 0% on healthy samples (biased). Offline-first here isn't just "prefer offline on
-    # principle" — it's measurably the best of the three for this modality right now.
+    invalid = check_image_domain("tb", pil_image)
+    if invalid is not None:
+        return invalid
+
+    # Measured on held-out ground-truth samples (see train_local_model.py / calibrate() in
+    # offline_cv.py / Documentations/MODEL_SOURCES.md): locally-trained MobileNetV3 82.5% >
+    # offline pixel-diff heuristic 74% > offline HF ViT 62% > Roboflow model (biased, see
+    # MODEL_SOURCES.md). Best-measured-first, same convention as every other tier's ordering here.
+    try:
+        r = _predict_local_trained("tb", pil_image)
+        if r is not None:
+            return r
+    except Exception:
+        pass
+
     try:
         import offline_cv
 
@@ -439,6 +577,10 @@ def _predict_maternal_roboflow(pil_image: Image.Image) -> dict:
 
 
 def predict_maternal(pil_image: Image.Image) -> dict:
+    invalid = check_image_domain("maternal", pil_image)
+    if invalid is not None:
+        return invalid
+
     try:
         return _predict_maternal_roboflow(pil_image)
     except RoboflowError:
@@ -452,6 +594,16 @@ def predict_maternal(pil_image: Image.Image) -> dict:
         # an annotated 'abnormal' case) — see offline_cv.calibrate(). Kept here (harmless) so
         # this modality picks it up automatically if the dataset ever gains negative examples.
         r = offline_cv.predict("maternal", pil_image)
+        if r is not None:
+            return r
+    except Exception:
+        pass
+
+    try:
+        # Not trained yet as of this writing — train_local_model.py skips Maternal until the
+        # dataset (or Models/Maternal/negative/) has at least one real negative image; kept here
+        # (harmless no-op until then) so this tier activates automatically once that changes.
+        r = _predict_local_trained("maternal", pil_image)
         if r is not None:
             return r
     except Exception:
@@ -589,6 +741,10 @@ def mammography_available() -> bool:
 
 
 def predict_mammography(pil_image: Image.Image) -> dict:
+    invalid = check_image_domain("mammography", pil_image)
+    if invalid is not None:
+        return invalid
+
     try:
         return _predict_mammography_workflow(pil_image)
     except RoboflowError:
@@ -597,9 +753,21 @@ def predict_mammography(pil_image: Image.Image) -> dict:
     try:
         import offline_cv
 
-        # Measured 96% on 50 held-out ground-truth samples (offline_cv.calibrate()) — a strong,
+        # Measured 98% on 50 held-out ground-truth samples (offline_cv.calibrate()) — a strong,
         # fully-offline fallback for when the hosted Workflow above is unreachable.
         r = offline_cv.predict("mammography", pil_image)
+        if r is not None:
+            return r
+    except Exception:
+        pass
+
+    try:
+        # Measured 98.7% held-out (77/78) -- statistically tied with the offline heuristic's 98%
+        # (49/50) above it, not measurably better given both sample sizes. Kept second rather than
+        # promoted ahead: the offline heuristic needs no torch/torchvision and no trained weights
+        # file, so it's the lighter zero-setup tier when both score about the same. Still clearly
+        # beats falling straight through to local YOLO weights that usually aren't bundled at all.
+        r = _predict_local_trained("mammography", pil_image)
         if r is not None:
             return r
     except Exception:
@@ -636,12 +804,13 @@ def predict_mammography(pil_image: Image.Image) -> dict:
 
 
 def model_status() -> dict:
-    """One line per modality: whether it's backed by a real model, and why not if not. Try
-    order (see predict_tb/predict_maternal/predict_mammography): Roboflow-hosted model first
-    where it's measurably the best option (Mammography, Maternal), or the offline pixel-diff
-    heuristic first where it measurably beats Roboflow (TB — see offline_cv.py calibrate() /
-    Documentations/MODEL_SOURCES.md), then the offline Hugging Face model as the deepest
-    fallback."""
+    """One line per modality: whether it's backed by a real model, and why not if not. Try order
+    (see predict_tb/predict_maternal/predict_mammography), best-measured-first: TB tries the
+    locally-trained MobileNetV3 first (82.5% held-out, see train_local_model.py) then the offline
+    pixel-diff heuristic (74%) then Roboflow (biased, see MODEL_SOURCES.md); Mammography and
+    Maternal try Roboflow first (the purpose-trained hosted models), then the offline pixel-diff
+    heuristic, then the locally-trained classifier, then the offline Hugging Face model as the
+    deepest fallback."""
     roboflow_ok = _roboflow_api_key() is not None
     try:
         import offline_cv
@@ -650,27 +819,37 @@ def model_status() -> dict:
         offline_cv_mammo = offline_cv.available("mammography")
     except Exception:
         offline_cv_tb = offline_cv_mammo = False
+    local_tb = local_model_available("tb")
+    local_mammo = local_model_available("mammography")
+    local_maternal = local_model_available("maternal")
 
     return {
         "Mammography (YOLOv8-OBB)": {
-            "real": roboflow_ok or offline_cv_mammo or mammography_available(),
+            "real": roboflow_ok or offline_cv_mammo or local_mammo or mammography_available(),
             "reason": "OK (Roboflow workflow)" if roboflow_ok
-            else ("OK (offline pixel-diff heuristic, ~96% on held-out data)" if offline_cv_mammo else (_mammo_load_error or "OK")),
+            else ("OK (offline pixel-diff heuristic, ~98% on held-out data)" if offline_cv_mammo
+                  else ("OK (locally-trained classifier, ~98.7% on held-out data)" if local_mammo
+                        else (_mammo_load_error or "OK"))),
             "source": f"Roboflow workflow {ROBOFLOW_MAMMOGRAPHY_WORKFLOW_ID}" if roboflow_ok
             else ("offline_cv.py heuristic (local BreastCancer-YOLOv8.coco dataset)" if offline_cv_mammo
-                  else "Roboflow b-davmu/breastcancer-yolov8 (local weights)"),
+                  else ("Models/Mammography/local_model.pt (trained via train_local_model.py)" if local_mammo
+                        else "Roboflow b-davmu/breastcancer-yolov8 (local weights)")),
         },
         "Tuberculosis (Chest X-Ray)": {
-            "real": offline_cv_tb or roboflow_ok or tb_available(),
-            "reason": "OK (offline pixel-diff heuristic, ~74% on held-out data — best measured of the 3 TB options)" if offline_cv_tb
-            else ("OK (Roboflow model)" if roboflow_ok else (_tb_load_error or "OK")),
-            "source": "offline_cv.py heuristic (local tuberculosis.coco dataset)" if offline_cv_tb
-            else (f"Roboflow {ROBOFLOW_TB_MODEL_ID}" if roboflow_ok else "sukhmani1303/tuberculosis-vit-model (Hugging Face)"),
+            "real": local_tb or offline_cv_tb or roboflow_ok or tb_available(),
+            "reason": "OK (locally-trained classifier, ~82.5% on held-out data — best measured of the 4 TB options)" if local_tb
+            else ("OK (offline pixel-diff heuristic, ~74% on held-out data)" if offline_cv_tb
+                  else ("OK (Roboflow model)" if roboflow_ok else (_tb_load_error or "OK"))),
+            "source": "Models/TB/local_model.pt (trained via train_local_model.py)" if local_tb
+            else ("offline_cv.py heuristic (local tuberculosis.coco dataset)" if offline_cv_tb
+                  else (f"Roboflow {ROBOFLOW_TB_MODEL_ID}" if roboflow_ok else "sukhmani1303/tuberculosis-vit-model (Hugging Face)")),
         },
         "Maternal Health (Ultrasound)": {
-            "real": roboflow_ok or maternal_available(),
-            "reason": "OK (Roboflow model)" if roboflow_ok else (_maternal_load_error or "OK"),
+            "real": roboflow_ok or local_maternal or maternal_available(),
+            "reason": "OK (Roboflow model)" if roboflow_ok
+            else ("OK (locally-trained classifier)" if local_maternal else (_maternal_load_error or "OK")),
             "source": f"Roboflow {ROBOFLOW_MATERNAL_MODEL_ID}" if roboflow_ok
-            else "shr3m/fetal-brain-plane-cnn (Hugging Face)",
+            else ("Models/Maternal/local_model.pt (trained via train_local_model.py)" if local_maternal
+                  else "shr3m/fetal-brain-plane-cnn (Hugging Face)"),
         },
     }

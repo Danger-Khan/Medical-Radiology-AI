@@ -46,10 +46,12 @@ h1, h2, h3, h4 {{ color: {C['text']} !important; }}
 .verdict-box {{ border-radius: 12px; padding: 20px; text-align: center; margin: 8px 0; }}
 .verdict-box.success {{ background: rgba(16,185,129,0.08); border: 2px solid rgba(16,185,129,0.3); }}
 .verdict-box.danger {{ background: rgba(239,68,68,0.08); border: 2px solid rgba(239,68,68,0.3); }}
+.verdict-box.warning {{ background: rgba(245,158,11,0.08); border: 2px solid rgba(245,158,11,0.3); }}
 .verdict-box .v-icon {{ font-size: 1.6rem; }}
 .verdict-box .v-title {{ font-size: 1.3rem; font-weight: 800; }}
 .verdict-box.success .v-title {{ color: {C['success']}; }}
 .verdict-box.danger .v-title {{ color: {C['danger']}; }}
+.verdict-box.warning .v-title {{ color: {C['warning']}; }}
 .verdict-box .v-sub {{ font-size: 0.85rem; margin-top: 4px; color: {C['text_muted']}; }}
 .console-log {{ background: #060a13; border: 1px solid {C['border_light']}; border-radius: 10px; padding: 14px;
   font-family: 'Consolas', monospace; font-size: 0.76rem; line-height: 1.7; max-height: 260px; overflow-y: auto; }}
@@ -302,7 +304,8 @@ def render_dashboard(selected_model):
 
         if st.session_state.inference_done and st.session_state.current_result:
             r = st.session_state.current_result
-            css = "danger" if r["is_critical"] else "success"
+            invalid = bool(r.get("invalid_image"))
+            css = "warning" if invalid else ("danger" if r["is_critical"] else "success")
             st.markdown(f"""<div class="verdict-box {css}"><div class="v-icon">{r['vicon']}</div>
             <div class="v-title">{r['verdict']}</div><div class="v-sub">{r['sub']}</div></div>""", unsafe_allow_html=True)
             st.markdown(f"""<div class="card"><span class="source-tag">Source: {r.get('source', 'N/A')}</span><br>
@@ -318,7 +321,9 @@ def render_dashboard(selected_model):
             st.session_state.bi_rads_selected = st.selectbox(l1, opts1, index=idx1)
             st.session_state.acr_density_selected = st.selectbox(l2, opts2, index=idx2)
 
-            if r["is_critical"]:
+            if invalid:
+                st.warning(f"🚫 {t('Not triaged')}: {t('wrong image type -- please re-upload the correct scan')}")
+            elif r["is_critical"]:
                 st.warning(f"⚠️ {t('Immediate Action Required')}: {t('Patient should be referred for specialist consultation')}")
             else:
                 st.success(f"✅ {t('Low risk - routine screening')}")

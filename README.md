@@ -3,8 +3,10 @@
 Two sibling UIs over the same shared logic, ported from the `Pink_Edge_AI-main` Streamlit hackathon
 demo (see `App/Misc/`): a Tkinter **desktop** app (`GUI.py`) and a responsive **Streamlit web** app
 (`streamlit_app.py`). Both share the same SQLite report cache and the same model backend
-(`inference.py`). Everything except this README and the two launchers below lives in **`App/`** —
-see `## Project layout`.
+(`inference.py`). Everything the desktop/web editions need lives in **`App/`**; two standalone,
+optional pieces live at the repo root next to it instead — a local Android build (`Apk/`) and RK3588
+edge-node deployment code (`RK3588 SBC/`) — since neither is part of running the desktop/web app
+itself. See `## Project layout`.
 
 ## What this is
 
@@ -15,17 +17,25 @@ accuracy against real ground truth**, not by "online first":
 
 | Modality | Try order | Measured accuracy |
 |---|---|---|
-| Mammography | Roboflow Workflow `breastcancer-yolov8-78tni` → offline pixel-diff heuristic → Simulated | Roboflow: correctly flagged ground truth (90.9%). Offline heuristic: **96%** |
-| Tuberculosis | **Offline pixel-diff heuristic** → Roboflow model → offline HF ViT | Offline heuristic: **74%** (best of the three — Roboflow model has a ⚠️ known issue, see MODEL_SOURCES.md) |
-| Maternal Health | Roboflow model `hash-maternal-health/1` → offline HF CNN | Roboflow: correctly flagged ground truth (88.3%) |
+| Mammography | Roboflow Workflow `breastcancer-yolov8-78tni` → offline pixel-diff heuristic → locally-trained classifier → Simulated | Roboflow: correctly flagged one ground-truth sample (90.9% confidence). Offline heuristic: **98%** (49/50). Locally-trained classifier: **98.7%** (77/78, tied with the heuristic within sample-size noise) |
+| Tuberculosis | **Locally-trained classifier** → offline pixel-diff heuristic → Roboflow model → offline HF ViT | Locally-trained classifier: **82.5%** (best of the four — Roboflow model has a ⚠️ known issue, see MODEL_SOURCES.md) |
+| Maternal Health | Roboflow model `hash-maternal-health/1` → offline HF CNN | Roboflow: correctly flagged ground truth (88.3%). (No locally-trained classifier yet — dataset has zero negative images) |
 
 The **offline pixel-diff heuristic** (`App/offline_cv.py`) needs no model weights and no internet,
 ever — it builds "typical positive" / "typical negative" reference images by averaging your own
 local labeled datasets (`App/Models/*/Data Set/`) and compares new images against both, drawing a
 real bounding box around whatever region actually differs. Run `python offline_cv.py` (from `App/`)
-to see its measured accuracy against held-out data for yourself. The Roboflow calls need a key +
-internet (cloud-dependent at inference time — a deliberate tradeoff for real predictions when
-available). Full detail (grounding, exact preprocessing, license, the TB accuracy finding) is in
+to see its measured accuracy against held-out data for yourself. The **locally-trained classifier**
+(`App/train_local_model.py`) is a genuine trained model (MobileNetV3, transfer-learned) fine-tuned
+directly on this project's own datasets — run `python train_local_model.py` (from `App/`) to (re)train
+it and print its own held-out accuracy; a modality only gets it ahead of another tier once it
+measurably beats that tier on the same held-out split. The Roboflow calls need a key + internet
+(cloud-dependent at inference time — a deliberate tradeoff for real predictions when available).
+Before any of that runs, every upload is also checked for **out-of-domain input** — if you upload,
+say, an ultrasound into the Mammography tab (or anything that just doesn't look like the right kind
+of scan), it says so ("Wrong Image Type") instead of forcing a triage verdict onto the wrong image
+type; see MODEL_SOURCES.md for the measured catch rate per modality. Full detail (grounding, exact
+preprocessing, license, the TB accuracy finding) is in
 [App/Documentations/MODEL_SOURCES.md](App/Documentations/MODEL_SOURCES.md). This is a hackathon-grade
 demo, not a validated medical device — confidence numbers and severity mappings are illustrative.
 
@@ -67,7 +77,9 @@ All three modalities check for a Roboflow API key and use it if present:
 
 ```
 README.md                 — this file
-Start.bat / Start_Web.bat   — launchers: cd into App/, install deps, run — nothing else lives at this level
+Start.bat / Start_Web.bat   — launchers: cd into App/, install deps, run
+Apk/                       — optional: local Android build (Kivy + Buildozer), see Apk/README.md
+RK3588 SBC/                — optional: RK3588 edge-node deployment code, see its own README.md
 
 App/                     — everything else: the app, its models, docs, tests, and reference material
   GUI.py                    — Tkinter desktop app: UI + local SQLite cache + reports + fallbacks
@@ -75,6 +87,8 @@ App/                     — everything else: the app, its models, docs, tests, 
   inference.py                — model loading + prediction dispatch for all three modalities
   offline_cv.py                — the offline pixel-diff heuristic (no model, no internet, ever);
                                     run directly (`python offline_cv.py`) to see its measured accuracy
+  train_local_model.py          — trains a real MobileNetV3 classifier per modality on this
+                                    project's own dataset; run directly to (re)train + measure it
   requirements.txt            — Python dependencies (shared by both editions)
   pink_edge_cache.db           — local report cache (SQLite; created on first "Save to Cache")
   roboflow_key.txt             — your Roboflow key, if you added one (gitignored)
@@ -84,7 +98,13 @@ App/                     — everything else: the app, its models, docs, tests, 
     TB/model.pt                          — sukhmani1303/tuberculosis-vit-model (TorchScript)
     Maternal/FINAL-test-evaluation.pt    — shr3m/fetal-brain-plane-cnn
     Mammography/                         — populated only if you add a Roboflow key (see above)
+    */local_model.pt, local_model_metadata.json — trained by train_local_model.py (gitignored,
+                                              reproducible — re-run the script to regenerate)
     */Data Set/                          — local labeled datasets offline_cv.py builds templates from
+    */positive/, */negative/             — optional: drop extra images in directly, no annotation
+                                              needed — folded into the template AND next training run
+    */validate/                          — optional: drop images in for a no-ground-truth spot-check
+                                              (`python offline_cv.py` prints a prediction for each)
     */templates/                         — offline_cv.py's generated reference images (gitignored, auto-rebuilt)
 
   Validation/
@@ -117,12 +137,14 @@ python Validation/validate.py
 (run from inside `App/` — or `python App/Validation/validate.py` from the repo root; paths inside
 the script are anchored to `App/`, not the caller's CWD, so both work)
 
-19 checks covering: module imports, placeholder image synthesis, detection overlay drawing, the
+21 checks covering: module imports, placeholder image synthesis, detection overlay drawing, the
 simulated scenario generators, a full SQLite cache round-trip (on a throwaway DB under `Validation/`
 — never touches the real `pink_edge_cache.db`), text/PDF report generation, real-model inference for
 all three modalities on both synthetic images *and* the real samples in `Test Data/`, ground-truth
 cross-checks against each modality's real COCO-annotated dataset (including an accuracy floor for
-the offline pixel-diff heuristic), the `run_triage()` dispatcher, and two full feature sweeps — every
+both the offline pixel-diff heuristic and the locally-trained classifier), the out-of-domain gate
+(a wrong-type image is rejected, real scans still pass through), the `run_triage()`
+dispatcher, and two full feature sweeps — every
 modality, save-to-cache, report downloads, language toggle, network mode, cloud sync — for both the
 **Tkinter UI** (hidden window, no mainloop) and the **Streamlit UI** (`streamlit.testing.v1.AppTest`,
 no browser). Exits non-zero (and prints `inference.py`'s per-modality model status) if anything fails.
@@ -163,6 +185,19 @@ boot (installing torch + downloading ~80 MB of weights) and keep an eye out for 
 crashes on that tier. If it struggles, the fixes in order of effort are: pin lighter dependency
 versions, or deploy on a paid tier / your own server (`streamlit run streamlit_app.py --server.port
 80 --server.address 0.0.0.0`, run from `App/`) instead.
+
+## Optional: local Android APK and RK3588 edge-node deployment
+
+Two standalone pieces at the repo root, neither needed to run the desktop/web app above:
+
+- **`Apk/`** — a local Android build (Kivy + Buildozer, not a port of `GUI.py`/`streamlit_app.py` —
+  see `Apk/README.md` for why torch/opencv don't cross-compile for Android and what runs instead).
+- **`RK3588 SBC/`** — deployment code for running this app as a real edge node on an RK3588 board
+  (kiosk autostart, the UART bridge to the ESP32/SIM800L GSM companion from `App/Hardware/WIRING.md`,
+  and NPU-accelerated inference via `rknn-toolkit-lite2`) — see `RK3588 SBC/README.md`.
+
+Neither has been built/run against real hardware in this environment (no Android SDK/NDK, no RK3588
+board) — both READMEs say so plainly; treat them as a verified-on-real-hardware starting point.
 
 ## Relationship to the original project
 
