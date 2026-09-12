@@ -1,2 +1,3 @@
-YOLOv8-OBB INT8 Quantized Model
-Rockchip RK3588 NPU Optimized
+version https://git-lfs.github.com/spec/v1
+oid sha256:fbeaf789d2a184f2fc76f749ea48c63004d82d90fbae3010ca1823d47e442262
+size 61

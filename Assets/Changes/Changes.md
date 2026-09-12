@@ -12,8 +12,15 @@ model backend) + `Validation/validate.py`.
   (mobile/tablet-width-aware CSS) rebuild — not the original `pink_edge.py` — that imports `GUI.py`
   directly for every piece of shared logic (constants, imaging, simulated scenarios, DB, reports, the
   `run_triage()` dispatcher) instead of duplicating it, so it gets the real TB/Maternal models and the
-  honest Mammography SIMULATED fallback for free. `GUI.py`'s own Tkinter code never executes unless
-  `GUI.py` is run directly, so importing it from a Streamlit script is safe.
+  honest Mammography SIMULATED fallback for free.
+- **Streamlit Community Cloud deploy fix.** First cloud deploy crashed with `ImportError: import
+  _tkinter` — `GUI.py` originally imported `tkinter`/`PIL.ImageTk` unconditionally at module level,
+  and Streamlit Cloud's Linux container has no system Tk libraries. Fixed by lazy-importing tkinter
+  only inside `PinkEdgeApp.__init__()`/`main()` (via `_lazy_import_tkinter()`, binding as module
+  globals) — `GUI.py` is now safely importable on a headless host, and the actual Tk import only
+  happens if the desktop app is really launched. Also swapped `opencv-python` → `opencv-python-headless`
+  in `requirements.txt` for the same reason (the GUI build needs `libGL.so.1`, which headless
+  containers don't have; nothing in this codebase calls `cv2.imshow` or other GUI functions).
 - **Android was the original ask, deferred.** This machine had no Java/Android SDK/Gradle installed;
   desktop was the fast, low-risk path using the Python already available. Nothing here forecloses an
   Android build later.
