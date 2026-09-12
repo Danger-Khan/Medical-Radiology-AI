@@ -96,6 +96,20 @@ on the same 50 held-out samples), Mammography gets it as a second offline option
 failing on purpose in the previous pass — now **passes for real**, because the underlying problem
 got fixed rather than tolerated.
 
+## Hardware planning docs (`Hardware/`)
+New folder, purely documentation/diagrams — no app code touched. Compares the four hardware ideas
+given (RK3588 SBC, Raspberry Pi, mobile APK, ESP32) as what they actually are: three candidate main
+compute boards plus one companion MCU that can't run these models at all but is useful for the
+GSM/telemetry link regardless of which board is chosen (`ALTERNATIVES.md`). Also: `HARDWARE_
+REQUIREMENTS.md` + `BOM.txt` (parts + costs), `ARCHITECTURE.md` (data flow, maps onto the existing
+`inference.py`/`offline_cv.py`/`GUI.py` stack), `WIRING.md` (pin-level, including the SIM800L
+power-supply gotcha that's a common real-world failure mode for that module), `DESIGN.md`
+(enclosure/power-resilience/thermal for an actual rural clinic), `STRUCTURE.md` (this folder's
+layout + multi-BHU fleet structure), and 5 generated PNG diagrams (`diagrams/`, produced from
+`_generate_diagrams.py` — reproducible from code, not a binary source-of-truth, same dark
+teal/pink palette as the app itself). Explicitly flagged as an unbuilt, unbench-tested plan, same
+honesty posture as `Documentations/MODEL_SOURCES.md` takes for the AI models.
+
 ## streamlit_app.py follow-up fixes
 `core.draw_bbox()` is shared with `GUI.py`, so the offline heuristic's real bounding boxes were
 already live in the Streamlit edition automatically — no change needed there. Two things weren't
