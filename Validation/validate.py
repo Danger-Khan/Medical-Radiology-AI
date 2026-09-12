@@ -4,9 +4,11 @@ Pink Edge AI (Desktop) — validation suite.
 ============================================
 Self-contained smoke/validation test for GUI.py + inference.py + streamlit_app.py: imports,
 imaging, simulated scenario generators, SQLite cache round-trip, text/PDF report generation, real
-model inference (TB + Maternal, on synthetic and real Test Data/ images), the SIMULATED fallback
-path (Mammography), the run_triage() dispatcher, and that both the Tkinter UI (hidden window, no
-mainloop) and the Streamlit UI (AppTest, no browser) actually build and can run one triage cycle.
+model inference for all three modalities (each tries its Roboflow-hosted model first, then an
+offline Hugging Face/local-weights fallback, then SIMULATED — see inference.py), a ground-truth
+cross-check against a COCO-annotated mammography sample, the run_triage() dispatcher, and that
+both the Tkinter UI (hidden window, no mainloop) and the Streamlit UI (AppTest, no browser)
+actually build and can run one triage cycle.
 
 Run with:  python Validation/validate.py   (from anywhere — paths below are anchored to the
 repo root, not the current working directory)
@@ -191,16 +193,19 @@ def _():
     require("real inference" in r["source"], "Maternal result should be tagged as real inference")
 
 
-@check("Mammography falls back to SIMULATED when no Roboflow key is configured")
+@check("Mammography: real Roboflow workflow if a key is configured, else SIMULATED")
 def _():
     has_key = inf._roboflow_api_key() is not None
-    available = inf.mammography_available()
-    if not has_key:
-        require(not available, "mammography_available() True with no Roboflow key present")
     img = GUI.gen_mammogram(seed=5)
     direct = inf.predict_mammography(img)
-    if not available:
-        require(direct is None, "predict_mammography should return None when no model is loaded")
+    if has_key:
+        # A key is configured (this project's roboflow_key.txt) -> the hosted Workflow should
+        # answer for real, not fall through to local weights or return None.
+        require(direct is not None, "predict_mammography returned None despite a Roboflow key being configured")
+        validate_result_shape(direct, "predict_mammography(roboflow)")
+        require("real inference" in direct["source"], "expected a real-inference source with a key configured")
+    elif not inf._find_local_mammo_weights():
+        require(direct is None, "predict_mammography should return None with no key and no local weights")
 
 
 # ---- 6b. real model inference on the real sample images in Test Data/ ----
@@ -218,16 +223,128 @@ def _():
         print(f"    {os.path.basename(f):40s} -> {r['verdict']:15s} ({r['confidence']:.1f}%)")
 
 
-@check("Mammography SIMULATED pathway on a real sample (Test Data/Breast Cancer)")
+@check("Mammography pathway on real samples (Test Data/Breast Cancer)")
 def _():
     from PIL import Image
 
     files = sorted(glob(os.path.join(TEST_DATA_DIR, "Breast Cancer", "*")))
     require(len(files) > 0, f"no sample files found under {TEST_DATA_DIR}\\Breast Cancer")
-    img = Image.open(files[0])
-    r = GUI.run_triage("Mammography (YOLOv8-OBB)", img)
-    validate_result_shape(r, "run_triage(mammography, real sample)")
-    print(f"    {os.path.basename(files[0]):40s} -> {r['verdict']:15s} ({r['source']})")
+    for f in files[:3]:  # a few, not all 40+ — keep this check fast
+        img = Image.open(f)
+        r = GUI.run_triage("Mammography (YOLOv8-OBB)", img)
+        validate_result_shape(r, f"run_triage(mammography, {os.path.basename(f)})")
+        print(f"    {os.path.basename(f):40s} -> {r['verdict']:15s} ({r['source']})")
+
+
+@check("Mammography Roboflow workflow matches ground truth on an annotated sample")
+def _():
+    """Cross-checks against the COCO annotation, not just 'did it run' — a stronger signal
+    than the other checks that the real model is actually doing something sensible."""
+    from PIL import Image
+
+    if not inf._roboflow_api_key():
+        return  # no key configured in this environment — nothing to cross-check
+    ds_dir = os.path.join(ROOT_DIR, "Models", "Mammography", "Data Set", "BreastCancer-YOLOv8.coco", "test")
+    ann_path = os.path.join(ds_dir, "_annotations.coco.json")
+    require(os.path.isfile(ann_path), f"no COCO annotations found at {ann_path}")
+    import json
+
+    with open(ann_path, "r", encoding="utf-8") as fh:
+        coco = json.load(fh)
+    require(len(coco["annotations"]) > 0, "COCO file has no annotations to cross-check against")
+    img_id = coco["annotations"][0]["image_id"]
+    file_name = next(im["file_name"] for im in coco["images"] if im["id"] == img_id)
+    img = Image.open(os.path.join(ds_dir, file_name))
+
+    r = inf.predict_mammography(img)
+    require(r is not None, "predict_mammography returned None on a known-positive annotated sample")
+    require(r["is_critical"], f"ground truth has a cancer annotation but the model said {r['verdict']!r}")
+    print(f"    {file_name} (ground truth: cancer) -> {r['verdict']} ({r['confidence']:.1f}%)")
+
+
+def _images_for_category(coco_path, ds_dir, category_name, limit=3):
+    """Loads a COCO annotation file and returns up to `limit` (PIL Image, file_name) pairs for
+    images annotated with the given category name. Matches ALL category ids with that name —
+    some Roboflow COCO exports have more than one id sharing a name (e.g. an unused id 0
+    placeholder alongside the real one) — a naive "first id with this name" lookup can silently
+    match zero real annotations."""
+    import json
+
+    from PIL import Image
+
+    with open(coco_path, "r", encoding="utf-8") as fh:
+        coco = json.load(fh)
+    cat_ids = {c["id"] for c in coco["categories"] if c["name"] == category_name}
+    if not cat_ids:
+        return []
+    anns = [a for a in coco["annotations"] if a["category_id"] in cat_ids]
+    out = []
+    seen_images = set()
+    for ann in anns:
+        if ann["image_id"] in seen_images:
+            continue
+        seen_images.add(ann["image_id"])
+        file_name = next(im["file_name"] for im in coco["images"] if im["id"] == ann["image_id"])
+        out.append((Image.open(os.path.join(ds_dir, file_name)), file_name))
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _first_image_for_category(coco_path, ds_dir, category_name):
+    imgs = _images_for_category(coco_path, ds_dir, category_name, limit=1)
+    return imgs[0] if imgs else None
+
+
+@check("TB Roboflow model matches ground truth (positive + negative annotated samples)")
+def _():
+    if not inf._roboflow_api_key():
+        return
+    ds_dir = os.path.join(ROOT_DIR, "Models", "TB", "Data Set", "tuberculosis.coco", "test")
+    ann_path = os.path.join(ds_dir, "_annotations.coco.json")
+    require(os.path.isfile(ann_path), f"no COCO annotations found at {ann_path}")
+
+    pos = _first_image_for_category(ann_path, ds_dir, "Tüberküloz")
+    require(pos is not None, "no 'Tüberküloz' (active TB) annotated sample found to cross-check against")
+    img, name = pos
+    r = inf.predict_tb(img)
+    require(r is not None, "predict_tb returned None on a known-positive annotated sample")
+    require(r["is_critical"], f"ground truth is active TB but the model said {r['verdict']!r}")
+    print(f"    {name} (ground truth: Tüberküloz) -> {r['verdict']} ({r['confidence']:.1f}%)")
+
+    # Majority vote over a few samples, not a single one: a real model calling one borderline
+    # image wrong is normal (this one has an rfdetr-small model with modest class balance —
+    # 159 'Sağlıklı' vs 432 'Tüberküloz' annotations); the integration is only broken if it's
+    # wrong most of the time, not if it's wrong once.
+    negatives = _images_for_category(ann_path, ds_dir, "Sağlıklı", limit=3)
+    require(len(negatives) > 0, "no 'Sağlıklı' (healthy) annotated sample found to cross-check against")
+    correct = 0
+    for img2, name2 in negatives:
+        r2 = inf.predict_tb(img2)
+        require(r2 is not None, f"predict_tb returned None on known-negative sample {name2}")
+        ok = not r2["is_critical"]
+        correct += ok
+        print(f"    {name2} (ground truth: Sağlıklı) -> {r2['verdict']} ({r2['confidence']:.1f}%) {'OK' if ok else 'MISS'}")
+    require(correct * 2 >= len(negatives),
+            f"model called {len(negatives) - correct}/{len(negatives)} known-healthy samples TB-positive — "
+            f"worse than a coin flip, likely a real integration bug, not just model noise")
+
+
+@check("Maternal Health Roboflow model matches ground truth on an annotated sample")
+def _():
+    if not inf._roboflow_api_key():
+        return
+    ds_dir = os.path.join(ROOT_DIR, "Models", "Maternal", "Data Set", "HASH Maternal Health.coco", "test")
+    ann_path = os.path.join(ds_dir, "_annotations.coco.json")
+    require(os.path.isfile(ann_path), f"no COCO annotations found at {ann_path}")
+
+    pos = _first_image_for_category(ann_path, ds_dir, "abnormal")
+    require(pos is not None, "no 'abnormal' annotated sample found to cross-check against")
+    img, name = pos
+    r = inf.predict_maternal(img)
+    require(r is not None, "predict_maternal returned None on a known-abnormal annotated sample")
+    require(r["is_critical"], f"ground truth is abnormal but the model said {r['verdict']!r}")
+    print(f"    {name} (ground truth: abnormal) -> {r['verdict']} ({r['confidence']:.1f}%)")
 
 
 # ---- 7. run_triage() dispatcher (what the UI actually calls) ----

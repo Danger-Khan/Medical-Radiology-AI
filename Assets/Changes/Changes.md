@@ -51,6 +51,30 @@ its TB code path was ever wired for real inference, with nothing real to load. T
 Every result-dict a model (real or simulated) produces carries a `source` field so the UI and reports
 show plainly which of the three cases produced it.
 
+## Roboflow integration (`imaad-ullah-khan-yameen` workspace)
+All three modalities now try the user's own trained Roboflow model/workflow first (real,
+purpose-trained on this project's data), falling back to the offline Hugging Face models above
+(TB, Maternal) or the simulated picker (Mammography) when Roboflow is unreachable. Grounded against
+real API calls (not guessed field names) via `inference-sdk`'s `InferenceHTTPClient`:
+- **Mammography** — Workflow `breastcancer-yolov8-78tni` (`client.run_workflow`).
+- **Tuberculosis** — Model `tuberculosis-tp2pv/1` (`client.infer`); real class taxonomy grounded
+  from the project's COCO export (Turkish labels, ASCII-folded in the API response — handled with
+  an accent-stripping normalizer, not hardcoded spellings).
+- **Maternal Health** — Model `hash-maternal-health/1` (`client.infer`); single-class detector
+  (`"abnormal"`), grounded the same way.
+
+**Key finding from validating against ground truth, not just "does it run"**: the TB model
+(`tuberculosis-tp2pv/1`) correctly caught a real positive case but called all 3 tested
+ground-truth-healthy samples TB Positive at 98-99% confidence — a real accuracy problem in that
+specific trained model (see `Documentations/MODEL_SOURCES.md` for full detail and next steps), not
+an integration bug. `Validation/validate.py`'s TB ground-truth check is left failing on purpose to
+keep surfacing this.
+
+Also added: a shared Roboflow client layer in `inference.py` (`RoboflowError`, retry-with-backoff,
+`_roboflow_infer`/`_roboflow_run_workflow`), and 4 new validation checks — ground-truth
+cross-checks for all three modalities against their real COCO-annotated datasets (which the user
+added under `Models/*/Data Set/`), not just "did it return something."
+
 ## Validation
 Added `Validation/validate.py` — a 14-check validation suite covering module imports, placeholder
 image synthesis, the detection-overlay drawing, the simulated scenario generators, a full SQLite

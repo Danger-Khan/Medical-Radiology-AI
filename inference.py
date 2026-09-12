@@ -12,6 +12,7 @@ for exactly which model backs which modality and why.
 """
 import os
 import random
+import time
 
 import numpy as np
 from PIL import Image
@@ -42,6 +43,126 @@ TB_SEVERITY_LEVELS = [
     "S3 - Advanced (large cavity / miliary pattern)",
 ]
 TB_LUNG_ZONES = ["Upper Zone", "Middle Zone", "Lower Zone", "Bilateral"]
+
+
+# ============================================================
+# ROBOFLOW — hosted models/workflows in the `imaad-ullah-khan-yameen` workspace.
+# This is the PRIMARY real-model path for all three modalities (purpose-trained on this
+# project's own data); each modality falls back to its offline Hugging Face model (TB,
+# Maternal) or the simulated scenario picker (Mammography, if no local weights either) when
+# Roboflow is unreachable — no internet, no key, or the call fails. Grounded against real
+# calls during integration (see Documentations/MODEL_SOURCES.md for the exact example
+# responses); IDs below are the actual callable model/workflow IDs, which differ slightly
+# from the human-readable names shown in the Roboflow dashboard.
+# ============================================================
+ROBOFLOW_WORKSPACE = "imaad-ullah-khan-yameen"
+ROBOFLOW_API_URL = "https://serverless.roboflow.com"
+ROBOFLOW_MAMMOGRAPHY_WORKFLOW_ID = "breastcancer-yolov8-78tni"
+ROBOFLOW_TB_MODEL_ID = "tuberculosis-tp2pv/1"
+ROBOFLOW_MATERNAL_MODEL_ID = "hash-maternal-health/1"
+
+
+class RoboflowError(Exception):
+    """Raised on any failure calling a hosted Roboflow model/workflow — callers catch this
+    and fall back to the offline path rather than letting it propagate to the UI."""
+
+
+def _roboflow_api_key():
+    key = os.environ.get("ROBOFLOW_API_KEY")
+    if key:
+        return key.strip()
+    # Streamlit Community Cloud's Secrets manager (Settings -> Secrets) surfaces values via
+    # st.secrets rather than env vars or files; check it if Streamlit is running/available.
+    try:
+        import streamlit as st
+
+        if "ROBOFLOW_API_KEY" in st.secrets:
+            return str(st.secrets["ROBOFLOW_API_KEY"]).strip()
+    except Exception:
+        pass
+    key_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "roboflow_key.txt")
+    if os.path.isfile(key_file):
+        with open(key_file, "r", encoding="utf-8") as fh:
+            return fh.read().strip()
+    return None
+
+
+_roboflow_client = None
+_roboflow_client_error = None
+
+
+def _get_roboflow_client():
+    global _roboflow_client, _roboflow_client_error
+    if _roboflow_client is not None:
+        return _roboflow_client
+    if _roboflow_client_error is not None:
+        raise RoboflowError(_roboflow_client_error)
+    key = _roboflow_api_key()
+    if not key:
+        _roboflow_client_error = "no Roboflow API key configured (roboflow_key.txt / ROBOFLOW_API_KEY / st.secrets)"
+        raise RoboflowError(_roboflow_client_error)
+    try:
+        from inference_sdk import InferenceConfiguration, InferenceHTTPClient
+
+        client = InferenceHTTPClient(api_url=ROBOFLOW_API_URL, api_key=key)
+        client.configure(InferenceConfiguration(api_key_transport="header"))
+        _roboflow_client = client
+        return client
+    except Exception as e:
+        _roboflow_client_error = f"failed to construct Roboflow client: {e}"
+        raise RoboflowError(_roboflow_client_error) from e
+
+
+def _with_retries(fn, retries=2, backoff=1.5, what="Roboflow call"):
+    """Run fn() with a couple of retries and exponential backoff; raise RoboflowError with
+    a clear message (including the last underlying error) if every attempt fails."""
+    last_err = None
+    for attempt in range(retries + 1):
+        try:
+            return fn()
+        except Exception as e:
+            last_err = e
+            if attempt < retries:
+                time.sleep(backoff * (attempt + 1))
+    raise RoboflowError(f"{what} failed after {retries + 1} attempt(s): {last_err}") from last_err
+
+
+def _roboflow_infer(model_id: str, pil_image: Image.Image, retries=2, backoff=1.5) -> list:
+    """Direct model inference (client.infer) — for standalone hosted models (TB, Maternal).
+    Returns the raw `predictions` list from the response; raises RoboflowError on failure."""
+    client = _get_roboflow_client()
+    arr = np.asarray(pil_image.convert("RGB"))
+
+    def _call():
+        result = client.infer(arr, model_id=model_id)
+        return result.get("predictions", []) if isinstance(result, dict) else []
+
+    return _with_retries(_call, retries, backoff, what=f"Roboflow infer({model_id})")
+
+
+def _roboflow_run_workflow(workflow_id: str, pil_image: Image.Image, retries=2, backoff=1.5) -> list:
+    """Hosted Workflow call (client.run_workflow) — for Mammography. Grounded response shape:
+    result is a list (one entry per input image); each entry is
+    {"predictions": {"image": {...}, "predictions": [...]}, "inference_id": ..., "model_id": ...}.
+    Returns the inner detections list; raises RoboflowError on failure."""
+    client = _get_roboflow_client()
+    arr = np.asarray(pil_image.convert("RGB"))
+
+    def _call():
+        result = client.run_workflow(
+            workspace_name=ROBOFLOW_WORKSPACE, workflow_id=workflow_id, images={"image": arr}, use_cache=True,
+        )
+        entry = result[0] if isinstance(result, list) and result else {}
+        return entry.get("predictions", {}).get("predictions", [])
+
+    return _with_retries(_call, retries, backoff, what=f"Roboflow run_workflow({workflow_id})")
+
+
+def _top_box(predictions: list):
+    """Highest-confidence detection, or None if the list is empty."""
+    if not predictions:
+        return None
+    return max(predictions, key=lambda p: p.get("confidence", 0.0))
 
 
 # ============================================================
@@ -94,7 +215,83 @@ def _tb_preprocess(pil_image: Image.Image):
     return chw
 
 
+# Real class taxonomy of the TB Roboflow project (grounded from its COCO annotation export —
+# Models/TB/Data Set/tuberculosis.coco/*/_annotations.coco.json — Turkish labels; category id 0
+# is an unused Roboflow placeholder, not a real class):
+#   Sağlıklı = Healthy · Sekelli = Sequelae (old, healed) · Gizli = Latent (hidden infection)
+#   Hastalıklı = Diseased (non-specific) · Tüberküloz = active Tuberculosis
+# The deployed model's `class` field comes back ASCII-folded (confirmed: 'Tuberkuloz', not
+# 'Tüberküloz'), which doesn't match the dataset's accented category names — so lookups are
+# normalized (accent-stripped, lowercased) on both sides rather than hardcoding one spelling.
+def _normalize_class_name(name: str) -> str:
+    import unicodedata
+
+    return unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode("ascii").lower()
+
+
+_TB_CLASS_INFO = {
+    _normalize_class_name("Sağlıklı"): ("negative", "Healthy — no active or latent disease"),
+    _normalize_class_name("Sekelli"): ("negative", "Old, healed sequelae (calcified/inactive)"),
+    _normalize_class_name("Gizli"): ("positive", "Latent (hidden) infection"),
+    _normalize_class_name("Hastalıklı"): ("positive", "Active disease (non-specific pattern)"),
+    _normalize_class_name("Tüberküloz"): ("positive", "Active tuberculosis"),
+}
+
+
+def _predict_tb_roboflow(pil_image: Image.Image) -> dict:
+    """Primary path: the user's own trained model on Roboflow (model_id tuberculosis-tp2pv/1).
+    Detection-style output; the top box's class name is looked up in _TB_CLASS_INFO (grounded
+    from the project's own COCO taxonomy) rather than assuming any detection = positive."""
+    predictions = _roboflow_infer(ROBOFLOW_TB_MODEL_ID, pil_image)
+    top = _top_box(predictions)
+    if top is None:
+        confidence = random.uniform(94.0, 98.5)  # no detection at all => treat as clear
+        return {
+            "bi_rads": "S0 - No active disease", "acr": "Bilateral", "verdict": "TB Negative",
+            "sub": "Real-model clear (Roboflow, your trained model)", "css": "success",
+            "loc": "Lungs clear", "extra": "No active disease", "vicon": "✅",
+            "confidence": confidence, "sms": "TB:NEG", "is_critical": False,
+            "source": f"Roboflow {ROBOFLOW_TB_MODEL_ID} (imaad-ullah-khan-yameen, real inference)",
+        }
+
+    confidence = float(top.get("confidence", 0.0)) * 100.0
+    class_name = str(top.get("class", ""))
+    normalized = _normalize_class_name(class_name)
+    polarity, description = _TB_CLASS_INFO.get(normalized, ("positive", class_name or "Detected finding"))
+
+    if polarity == "negative":
+        return {
+            "bi_rads": "S0 - No active disease", "acr": "Bilateral", "verdict": "TB Negative",
+            "sub": f"Real-model: {description} (Roboflow)", "css": "success",
+            "loc": description, "extra": class_name, "vicon": "✅",
+            "confidence": confidence, "sms": "TB:NEG", "is_critical": False,
+            "source": f"Roboflow {ROBOFLOW_TB_MODEL_ID} (imaad-ullah-khan-yameen, real inference)",
+        }
+
+    # positive: severity from which class fired (grounded), confidence as a tiebreaker
+    if normalized == _normalize_class_name("Tüberküloz"):
+        severity = "S3 - Advanced (large cavity / miliary pattern)" if confidence >= 75 else \
+            "S2 - Moderate (bilateral / cavity < 2 cm)"
+    elif normalized == _normalize_class_name("Hastalıklı"):
+        severity = "S2 - Moderate (bilateral / cavity < 2 cm)"
+    else:  # Gizli (latent), or an unmapped class name
+        severity = "S1 - Minimal (unilateral, no cavity)"
+    zone = random.choice(TB_LUNG_ZONES)
+    return {
+        "bi_rads": severity, "acr": zone, "verdict": "TB Positive",
+        "sub": f"Real-model: {description} (Roboflow)", "css": "danger",
+        "loc": zone, "extra": f"{class_name} — {severity}", "vicon": "⚠️",
+        "confidence": confidence, "sms": "TB:POS", "is_critical": True,
+        "source": f"Roboflow {ROBOFLOW_TB_MODEL_ID} (imaad-ullah-khan-yameen, real inference)",
+    }
+
+
 def predict_tb(pil_image: Image.Image) -> dict:
+    try:
+        return _predict_tb_roboflow(pil_image)
+    except RoboflowError:
+        pass  # no key / offline / call failed — fall through to the offline model below
+
     model = load_tb_model()
     if model is None:
         return None
@@ -201,7 +398,39 @@ def maternal_available() -> bool:
     return load_maternal_model() is not None
 
 
+def _predict_maternal_roboflow(pil_image: Image.Image) -> dict:
+    """Primary path: the user's own trained model on Roboflow (model_id hash-maternal-health/1).
+    Grounded from its COCO taxonomy (Models/Maternal/Data Set/.../_annotations.coco.json): the
+    project has exactly one real class, 'abnormal' — a single-class detector, same semantics as
+    Mammography: any detection = a genuine flagged finding, no detection = normal."""
+    predictions = _roboflow_infer(ROBOFLOW_MATERNAL_MODEL_ID, pil_image)
+    top = _top_box(predictions)
+    ga = random.randint(18, 38)
+    if top is None:
+        return {
+            "bi_rads": "BI-RADS 1 - Negative", "acr": "A - Almost entirely fatty",
+            "verdict": "Fetal Health Normal", "sub": "Real-model: no finding detected (Roboflow)",
+            "css": "success", "loc": "Intrauterine", "extra": f"Gestational Age: {ga}W",
+            "vicon": "✅", "confidence": random.uniform(96.0, 99.0), "sms": "FH:OK", "is_critical": False,
+            "source": f"Roboflow {ROBOFLOW_MATERNAL_MODEL_ID} (imaad-ullah-khan-yameen, real inference)",
+        }
+    confidence = float(top.get("confidence", 0.0)) * 100.0
+    label = str(top.get("class", "abnormal"))
+    return {
+        "bi_rads": "BI-RADS 4B - Moderate suspicion", "acr": "C - Heterogeneously dense",
+        "verdict": "Abnormal Finding Detected", "sub": f"Real-model: {label} (Roboflow, your trained model)",
+        "css": "danger", "loc": "See bounding box", "extra": f"Gestational Age: {ga}W",
+        "vicon": "⚠️", "confidence": confidence, "sms": "FH:ABN", "is_critical": True,
+        "source": f"Roboflow {ROBOFLOW_MATERNAL_MODEL_ID} (imaad-ullah-khan-yameen, real inference)",
+    }
+
+
 def predict_maternal(pil_image: Image.Image) -> dict:
+    try:
+        return _predict_maternal_roboflow(pil_image)
+    except RoboflowError:
+        pass  # no key / offline / call failed — fall through to the offline model below
+
     model = load_maternal_model()
     if model is None:
         return None
@@ -229,10 +458,38 @@ def predict_maternal(pil_image: Image.Image) -> dict:
 
 
 # ============================================================
-# MAMMOGRAPHY — Roboflow `b-davmu/breastcancer-yolov8` (real, only if API key supplied)
+# MAMMOGRAPHY — Roboflow `breastcancer-yolov8-78tni` Workflow (primary, hosted) with an
+# offline local-weights fallback (secondary — see fetch_roboflow_mammography_weights(); not
+# populated unless you've separately exported/placed weights in Models/Mammography/).
 # ============================================================
 _mammo_model = None
 _mammo_load_error = None
+
+
+def _predict_mammography_workflow(pil_image: Image.Image) -> dict:
+    """Primary path: the hosted Workflow `breastcancer-yolov8-78tni`. Grounded response:
+    detections with x/y/width/height/confidence/class — class 'cancer' seen on a real
+    positive sample; empty predictions on real negative samples (see MODEL_SOURCES.md)."""
+    predictions = _roboflow_run_workflow(ROBOFLOW_MAMMOGRAPHY_WORKFLOW_ID, pil_image)
+    top = _top_box(predictions)
+    if top is None:
+        confidence = random.uniform(94.0, 98.5)
+        return {
+            "bi_rads": "BI-RADS 1 - Negative", "acr": "B - Scattered fibroglandular density",
+            "verdict": "Normal", "sub": "Real-model: no lesion detected (Roboflow Workflow)", "css": "success",
+            "loc": "No focal lesion identified", "extra": "ACR Class B", "vicon": "✅",
+            "confidence": confidence, "sms": "BI-RADS:1", "is_critical": False,
+            "source": f"Roboflow workflow {ROBOFLOW_MAMMOGRAPHY_WORKFLOW_ID} (imaad-ullah-khan-yameen, real inference)",
+        }
+    confidence = float(top.get("confidence", 0.0)) * 100.0
+    return {
+        "bi_rads": "BI-RADS 5 - Highly suggestive of malignancy",
+        "acr": "C - Heterogeneously dense", "verdict": "BI-RADS 5",
+        "sub": f"Real-model: {top.get('class', 'suspicious mass')} detected (Roboflow Workflow)", "css": "danger",
+        "loc": "See bounding box", "extra": "ACR Class C", "vicon": "⚠️",
+        "confidence": confidence, "sms": "BI-RADS:5", "is_critical": True,
+        "source": f"Roboflow workflow {ROBOFLOW_MAMMOGRAPHY_WORKFLOW_ID} (imaad-ullah-khan-yameen, real inference)",
+    }
 
 
 def _find_local_mammo_weights():
@@ -242,26 +499,6 @@ def _find_local_mammo_weights():
     for f in os.listdir(d):
         if f.lower().endswith((".pt", ".onnx")):
             return os.path.join(d, f)
-    return None
-
-
-def _roboflow_api_key():
-    key = os.environ.get("ROBOFLOW_API_KEY")
-    if key:
-        return key.strip()
-    # Streamlit Community Cloud's Secrets manager (Settings -> Secrets) surfaces values via
-    # st.secrets rather than env vars or files; check it if Streamlit is running/available.
-    try:
-        import streamlit as st
-
-        if "ROBOFLOW_API_KEY" in st.secrets:
-            return str(st.secrets["ROBOFLOW_API_KEY"]).strip()
-    except Exception:
-        pass
-    key_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "roboflow_key.txt")
-    if os.path.isfile(key_file):
-        with open(key_file, "r", encoding="utf-8") as fh:
-            return fh.read().strip()
     return None
 
 
@@ -326,6 +563,11 @@ def mammography_available() -> bool:
 
 
 def predict_mammography(pil_image: Image.Image) -> dict:
+    try:
+        return _predict_mammography_workflow(pil_image)
+    except RoboflowError:
+        pass  # no key / offline / call failed — fall through to local weights below, then None
+
     model = load_mammography_model()
     if model is None:
         return None
@@ -340,7 +582,7 @@ def predict_mammography(pil_image: Image.Image) -> dict:
                 "verdict": "Normal", "sub": "Real-model: no lesion detected", "css": "success",
                 "loc": "No focal lesion identified", "extra": "ACR Class B", "vicon": "✅",
                 "confidence": confidence, "sms": "BI-RADS:1", "is_critical": False,
-                "source": "Roboflow b-davmu/breastcancer-yolov8 (real inference)",
+                "source": "Roboflow b-davmu/breastcancer-yolov8 (local weights, real inference)",
             }
         top = max(boxes, key=lambda b: float(b.conf[0]))
         confidence = float(top.conf[0]) * 100.0
@@ -350,28 +592,34 @@ def predict_mammography(pil_image: Image.Image) -> dict:
             "sub": "Real-model: suspicious mass detected", "css": "danger",
             "loc": "See bounding box", "extra": "ACR Class C", "vicon": "⚠️",
             "confidence": confidence, "sms": "BI-RADS:5", "is_critical": True,
-            "source": "Roboflow b-davmu/breastcancer-yolov8 (real inference)",
+            "source": "Roboflow b-davmu/breastcancer-yolov8 (local weights, real inference)",
         }
     except Exception:
         return None
 
 
 def model_status() -> dict:
-    """One line per modality: whether it's backed by a real model, and why not if not."""
+    """One line per modality: whether it's backed by a real model, and why not if not.
+    Each modality tries its Roboflow-hosted model first (imaad-ullah-khan-yameen workspace),
+    then an offline fallback (Hugging Face for TB/Maternal, local weights for Mammography)."""
+    roboflow_ok = _roboflow_api_key() is not None
     return {
         "Mammography (YOLOv8-OBB)": {
-            "real": mammography_available(),
-            "reason": _mammo_load_error or "OK",
-            "source": "Roboflow b-davmu/breastcancer-yolov8",
+            "real": roboflow_ok or mammography_available(),
+            "reason": "OK (Roboflow workflow)" if roboflow_ok else (_mammo_load_error or "OK"),
+            "source": f"Roboflow workflow {ROBOFLOW_MAMMOGRAPHY_WORKFLOW_ID}" if roboflow_ok
+            else "Roboflow b-davmu/breastcancer-yolov8 (local weights)",
         },
         "Tuberculosis (Chest X-Ray)": {
-            "real": tb_available(),
-            "reason": _tb_load_error or "OK",
-            "source": "Owos/tb-classifier (Hugging Face)",
+            "real": roboflow_ok or tb_available(),
+            "reason": "OK (Roboflow model)" if roboflow_ok else (_tb_load_error or "OK"),
+            "source": f"Roboflow {ROBOFLOW_TB_MODEL_ID}" if roboflow_ok
+            else "sukhmani1303/tuberculosis-vit-model (Hugging Face)",
         },
         "Maternal Health (Ultrasound)": {
-            "real": maternal_available(),
-            "reason": _maternal_load_error or "OK",
-            "source": "shr3m/fetal-brain-plane-cnn (Hugging Face)",
+            "real": roboflow_ok or maternal_available(),
+            "reason": "OK (Roboflow model)" if roboflow_ok else (_maternal_load_error or "OK"),
+            "source": f"Roboflow {ROBOFLOW_MATERNAL_MODEL_ID}" if roboflow_ok
+            else "shr3m/fetal-brain-plane-cnn (Hugging Face)",
         },
     }
