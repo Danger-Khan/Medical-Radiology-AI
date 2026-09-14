@@ -1,8 +1,9 @@
 @echo off
-REM Pink Edge AI (Streamlit web edition) launcher — opens a local browser UI, same real models
-REM and SQLite cache as the desktop app (Start.bat / GUI.py). First run needs internet once to
-REM download model weights + Python deps; after that it's a local-only web server (no cloud calls).
-REM All the actual code/data lives in App\ -- this launcher just cd's in and runs it.
+REM Medical Radiology AI (Streamlit web edition) launcher — opens a local browser UI, same real
+REM models and SQLite cache as the desktop console (Start.bat / radiology_console.py). First run
+REM needs internet once to download model weights + Python deps; after that it's a local-only web
+REM server (no cloud calls). All the actual code/data lives in App\ -- this launcher just cd's in
+REM and runs it.
 
 cd /d "%~dp0App"
 
@@ -22,11 +23,11 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo Launching Pink Edge AI (Streamlit)...
-python -m streamlit run streamlit_app.py
+echo Launching Medical Radiology AI (Streamlit)...
+python -m streamlit run radiology_web.py
 
 if errorlevel 1 (
     echo.
-    echo Pink Edge AI exited with an error. See the message above.
+    echo Medical Radiology AI exited with an error. See the message above.
     pause
 )

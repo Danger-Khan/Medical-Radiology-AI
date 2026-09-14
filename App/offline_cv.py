@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Pink Edge AI — offline, non-neural triage fallback (classical pixel-difference comparison).
+Medical Radiology AI — offline, non-neural triage fallback (classical pixel-difference comparison).
 ================================================================================================
 No trained model, no internet, no API key, no huggingface_hub/torch/ultralytics dependency at
 all: builds a "typical positive" and "typical negative" reference template per modality by
@@ -50,15 +50,28 @@ _DATASETS = {
         "positive_categories": ["Tüberküloz", "Hastalıklı"],
         "negative_categories": ["Sağlıklı", "Sekelli"],
     },
-    "maternal": {
-        "models_subdir": "Maternal", "dataset_dir_name": "HASH Maternal Health.coco",
-        "positive_categories": ["abnormal"],
-        "negative_categories": [],  # single-class dataset -> unannotated images are the implicit negative set
-    },
     "mammography": {
         "models_subdir": "Mammography", "dataset_dir_name": "BreastCancer-YOLOv8.coco",
         "positive_categories": ["cancer"],
         "negative_categories": ["normal"],
+    },
+    # Bone is the one modality where positive/negative do NOT mean disease/healthy -- the source
+    # dataset (yakin/bone-fracture-tn84w, CC BY 4.0) has zero normal/healthy bone X-rays annotated
+    # (every one of its 2147 images has at least one fracture-type box), so there's no "negative"
+    # class to build an OK reference from. Instead these slots are reused for a genuine SUB-TYPE
+    # distinction between two real, well-populated classes: "positive" = Dislocation ("Shift"),
+    # "negative" = every other specific fracture-type category ("Crack"). See
+    # Documentations/MODEL_SOURCES.md for why, and inference.py's predict_bone() for how presence-of
+    # -fracture-at-all (OK vs. not) is determined separately by the real-time detector tiers.
+    "bone": {
+        "models_subdir": "Bone", "dataset_dir_name": "Bone-Fracture.coco",
+        "positive_categories": ["Dislocation"],
+        "negative_categories": ["Avulsion", "Comminuted", "Fracture", "Greenstick", "Hairline",
+                                 "Impacted", "Longitudinal", "Oblique", "Pathological", "Spiral"],
+        # Excluded on purpose: "Bone fracture detection - v1 2023-03-05 5-51pm" and lowercase
+        # "fracture" -- generic/duplicate boxes carried over from the dataset's earlier single-class
+        # annotation pass (same "unused Roboflow placeholder" pattern noted for Maternal's COCO
+        # export); they don't distinguish Shift from Crack, so including them would only add noise.
     },
 }
 
@@ -279,7 +292,7 @@ def _confidence(change_score):
 
 # ============================================================
 # OUT-OF-DOMAIN DETECTION — "does this even look like the right kind of scan at all", checked
-# BEFORE running any real triage tier (see inference.py's predict_tb/mammography/maternal). Fully
+# BEFORE running any real triage tier (see inference.py's predict_tb/mammography/bone). Fully
 # offline, reuses the same templates/correlation machinery as the triage heuristic above rather
 # than adding a new dependency: a real chest X-ray correlates reasonably well with the TB generic
 # reference even when it disagrees on diagnosis; a photo of a cat or a document does not correlate
@@ -295,9 +308,18 @@ DOMAIN_THRESHOLDS = {
     # a real mammogram rather than maximizing catch rate (its scans vary too much in crop/zoom for
     # this pixel-correlation method to separate as cleanly as TB's more standardized X-rays do).
     "tb": 0.47,          # measured: 95% real TB scans pass, 97% wrong-modality images caught
-    "maternal": 0.37,    # measured: 80% real ultrasounds pass, 82% wrong-modality images caught
     "mammography": 0.03,  # measured: 90% real mammograms pass, only ~33% wrong-modality images
                            # caught at this lenient setting — see MODEL_SOURCES.md before relying on it
+    # Measured via calibrate_domain("bone"): in-domain scores (mean 0.28) and out-of-domain scores
+    # (mean 0.30) almost entirely OVERLAP for this modality -- bone X-rays vary too much in framing
+    # (wrist vs. skull vs. shoulder) for one generic reference template to separate them from other
+    # radiograph types this way, worse than Mammography's already-weak case. A negative threshold
+    # would pass 100% of real scans but ALSO passes genuinely unrelated images (random noise scores
+    # ~0, and the worst real bone sample measured -0.11 -- noise scores HIGHER than that real image,
+    # so no threshold can both pass every real scan and reject noise here). 0.0 is the honest
+    # compromise actually used: catches noise/blank images reliably while still passing ~93%
+    # (14/15 measured) of real bone X-rays -- see MODEL_SOURCES.md before relying on it.
+    "bone": 0.0,
 }
 
 
@@ -305,7 +327,7 @@ def _generic_reference(modality):
     """Whichever of the positive/negative templates exist, averaged — a "what does this modality's
     scan look like at all" reference for domain checking, independent of _get_templates()'s
     requirement that BOTH classes exist (out-of-domain detection only needs "some reference",
-    not a full positive/negative split — useful for e.g. Maternal, which has no negative class)."""
+    not a full positive/negative split — useful for a modality with only one class populated)."""
     pos, neg = _get_templates(modality)
     if pos is not None and neg is not None:
         return ((pos.astype(np.float64) + neg.astype(np.float64)) / 2).astype(np.uint8)
@@ -342,13 +364,6 @@ _MODALITY_VOCAB = {
         "neg_bi_rads": "S0 - No active disease", "acr_pos": "Upper Zone", "acr_neg": "Bilateral",
         "sms_pos": "TB:POS", "sms_neg": "TB:NEG",
     },
-    "maternal": {
-        "pos_verdict": "Abnormal Finding Detected", "neg_verdict": "Fetal Health Normal",
-        "pos_bi_rads_by_tier": ["BI-RADS 4A - Low suspicion (Biopsy recommended)",
-                                 "BI-RADS 4B - Moderate suspicion", "BI-RADS 4C - High suspicion"],
-        "neg_bi_rads": "BI-RADS 1 - Negative", "acr_pos": "C - Heterogeneously dense",
-        "acr_neg": "A - Almost entirely fatty", "sms_pos": "FH:ABN", "sms_neg": "FH:OK",
-    },
     "mammography": {
         "pos_verdict": "BI-RADS 5", "neg_verdict": "Normal",
         "pos_bi_rads_by_tier": ["BI-RADS 4A - Low suspicion (Biopsy recommended)", "BI-RADS 4B - Moderate suspicion",
@@ -359,7 +374,36 @@ _MODALITY_VOCAB = {
 }
 
 
+def _to_bone_result(confidence, is_shift, bbox):
+    """Bone reuses the positive/negative offline-heuristic machinery for a Shift-vs-Crack SUB-TYPE
+    call, not disease-vs-healthy like every other modality here -- both outcomes are real, abnormal
+    findings (a fracture either way), so both branches are flagged danger/critical, unlike the
+    negative=healthy/success branch below. This tier never returns "OK" on its own -- presence-of
+    -fracture-at-all is decided by inference.py's real-time detector tiers before this sub-typer
+    ever runs (see predict_bone())."""
+    source = "Offline pixel-comparison heuristic vs. local Bone dataset (no model, no internet)"
+    if is_shift:
+        return {
+            "bi_rads": "Shift - Dislocation / displaced fracture", "acr": "Dislocation",
+            "verdict": "Bone Shift (Dislocation)",
+            "sub": "Offline heuristic: image pattern leans toward the Dislocation reference set",
+            "css": "danger", "loc": "See bounding box", "extra": "Shift (Dislocation)",
+            "vicon": "⚠️", "confidence": confidence, "sms": "BONE:SHIFT", "is_critical": True,
+            "source": source, "bbox": bbox,
+        }
+    return {
+        "bi_rads": "Crack - Fracture detected", "acr": "Fracture (non-dislocation)",
+        "verdict": "Bone Crack (Fracture)",
+        "sub": "Offline heuristic: image pattern leans toward the non-dislocation fracture reference set",
+        "css": "danger", "loc": "See bounding box", "extra": "Crack (Fracture)",
+        "vicon": "⚠️", "confidence": confidence, "sms": "BONE:CRACK", "is_critical": True,
+        "source": source, "bbox": bbox,
+    }
+
+
 def _to_result(modality, confidence, is_positive, bbox):
+    if modality == "bone":
+        return _to_bone_result(confidence, is_positive, bbox)
     v = _MODALITY_VOCAB[modality]
     source = f"Offline pixel-comparison heuristic vs. local {modality} dataset (no model, no internet)"
     if is_positive:
@@ -386,7 +430,7 @@ def available(modality: str) -> bool:
 
 
 def predict(modality: str, pil_image: Image.Image):
-    """modality: 'tb' | 'maternal' | 'mammography'. Returns a result-dict (with an extra `bbox`
+    """modality: 'tb' | 'bone' | 'mammography'. Returns a result-dict (with an extra `bbox`
     field — normalized (x, y, w, h) fractions, or None) or None if no local dataset is present
     to build templates from."""
     positive_tpl, negative_tpl = _get_templates(modality)

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Pink Edge AI (Desktop) — real on-device model loaders/predictors.
+Medical Radiology AI (Desktop) — real on-device model loaders/predictors.
 ====================================================================
 One function per modality: `load_<modality>()` (lazy, cached) and `predict_<modality>(pil_image)`.
 
@@ -43,13 +43,25 @@ TB_SEVERITY_LEVELS = [
     "S3 - Advanced (large cavity / miliary pattern)",
 ]
 TB_LUNG_ZONES = ["Upper Zone", "Middle Zone", "Lower Zone", "Bilateral"]
+BONE_STATUS_OPTIONS = [
+    "OK - No fracture or dislocation",
+    "Crack - Fracture detected (non-dislocation)",
+    "Shift - Dislocation / displaced fracture",
+]
+# Grounded from yakin/bone-fracture-tn84w's own real category taxonomy (see MODEL_SOURCES.md) --
+# the specific fracture sub-type, when the offline heuristic/local classifier could determine one.
+BONE_TYPE_OPTIONS = [
+    "N/A - No detection", "Dislocation (Shift)", "Avulsion", "Comminuted", "Fracture",
+    "Greenstick", "Hairline", "Impacted", "Longitudinal", "Oblique", "Pathological", "Spiral",
+]
 
 
 # ============================================================
 # ROBOFLOW — hosted models/workflows in the `imaad-ullah-khan-yameen` workspace.
-# This is the PRIMARY real-model path for all three modalities (purpose-trained on this
-# project's own data); each modality falls back to its offline Hugging Face model (TB,
-# Maternal) or the simulated scenario picker (Mammography, if no local weights either) when
+# This is the PRIMARY real-model path for Mammography/TB/Bone (purpose-trained on this
+# project's own data for Mammography/TB; Bone instead calls a public Roboflow Universe project --
+# see its own section below for why); each modality falls back to its offline Hugging Face model
+# (TB, Bone) or the simulated scenario picker (Mammography, if no local weights either) when
 # Roboflow is unreachable — no internet, no key, or the call fails. Grounded against real
 # calls during integration (see Documentations/MODEL_SOURCES.md for the exact example
 # responses); IDs below are the actual callable model/workflow IDs, which differ slightly
@@ -59,7 +71,12 @@ ROBOFLOW_WORKSPACE = "imaad-ullah-khan-yameen"
 ROBOFLOW_API_URL = "https://serverless.roboflow.com"
 ROBOFLOW_MAMMOGRAPHY_WORKFLOW_ID = "breastcancer-yolov8-78tni"
 ROBOFLOW_TB_MODEL_ID = "tuberculosis-tp2pv/1"
-ROBOFLOW_MATERNAL_MODEL_ID = "hash-maternal-health/1"
+# Public Roboflow Universe project (workspace "yakin", not this project's own workspace) -- the
+# ONLY one of its 3 versions with an actually trained/deployed model (grounded via a real call to
+# its training summary: precision 86.5%, recall 71.1%, mAP@50 77.3%). Callable with any valid
+# Roboflow API key, same as `b-davmu/breastcancer-yolov8` was used as a Mammography placeholder
+# before the user's own workspace model existed. See MODEL_SOURCES.md for the full grounding.
+ROBOFLOW_BONE_MODEL_ID = "bone-fracture-tn84w/1"
 
 
 class RoboflowError(Exception):
@@ -128,7 +145,7 @@ def _with_retries(fn, retries=2, backoff=1.5, what="Roboflow call"):
 
 
 def _roboflow_infer(model_id: str, pil_image: Image.Image, retries=2, backoff=1.5) -> list:
-    """Direct model inference (client.infer) — for standalone hosted models (TB, Maternal).
+    """Direct model inference (client.infer) — for standalone hosted models (TB, Bone).
     Returns the raw `predictions` list from the response; raises RoboflowError on failure."""
     client = _get_roboflow_client()
     arr = np.asarray(pil_image.convert("RGB"))
@@ -174,7 +191,7 @@ def _top_box(predictions: list):
 # ============================================================
 _EXPECTED_IMAGE_DESC = {
     "tb": "a chest X-ray", "mammography": "a mammogram (breast X-ray)",
-    "maternal": "a fetal/obstetric ultrasound",
+    "bone": "a bone X-ray (limb/joint radiograph)",
 }
 
 
@@ -484,153 +501,125 @@ def predict_tb(pil_image: Image.Image) -> dict:
 
 
 # ============================================================
-# MATERNAL HEALTH — shr3m/fetal-brain-plane-cnn (PyTorch CNN, CC BY 4.0)
-# https://huggingface.co/shr3m/fetal-brain-plane-cnn
+# BONE — presence-of-fracture is decided in real time (Roboflow `yakin/bone-fracture-tn84w/1`
+# primary, `prithivMLmods/Bone-Fracture-Detection` Hugging Face SigLIP2 fallback, Apache-2.0);
+# neither of those two real models' own trained taxonomy distinguishes a dislocation ("Shift")
+# from any other kind of fracture ("Crack") -- once one of them confirms a fracture is present,
+# offline_cv.py's locally-built heuristic (or the locally-trained classifier, once trained) adds
+# that sub-type call, using the real Dislocation-vs-other-fracture-type annotations from this
+# project's own copy of the dataset's richer v3 export (see offline_cv.py's _DATASETS["bone"] and
+# Documentations/MODEL_SOURCES.md for exactly what's grounded here and what's a documented gap).
 # ============================================================
-_maternal_model = None
-_maternal_load_error = None
-_FETAL_CLASSES = ["Trans-thalamic", "Trans-cerebellum", "Trans-ventricular", "Other"]
-_FETAL_MEAN, _FETAL_STD = 0.17076, 0.17093
+_bone_hf_model = None
+_bone_hf_load_error = None
 
 
-class FetalPlaneCNN:
-    """Lazily builds the torch.nn.Module architecture matching the HF checkpoint
-    (four-block grayscale CNN — see MODEL_SOURCES.md for the source repo's model.py)."""
-
-    @staticmethod
-    def build(n_classes=4, width=32, dropout=0.5, in_ch=1):
-        import torch.nn as nn
-
-        def block(cin, cout):
-            return nn.Sequential(
-                nn.Conv2d(cin, cout, 3, padding=1, bias=False), nn.BatchNorm2d(cout), nn.ReLU(inplace=True),
-                nn.Conv2d(cout, cout, 3, padding=1, bias=False), nn.BatchNorm2d(cout), nn.ReLU(inplace=True),
-                nn.MaxPool2d(2),
-            )
-
-        class _Net(nn.Module):
-            def __init__(self):
-                super().__init__()
-                w = width
-                self.features = nn.Sequential(block(in_ch, w), block(w, w * 2), block(w * 2, w * 4), block(w * 4, w * 8))
-                self.head = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Flatten(), nn.Dropout(dropout), nn.Linear(w * 8, n_classes))
-
-            def forward(self, x):
-                return self.head(self.features(x))
-
-        return _Net()
-
-
-def load_maternal_model():
-    global _maternal_model, _maternal_load_error
-    if _maternal_model is not None or _maternal_load_error is not None:
-        return _maternal_model
+def load_bone_model():
+    """Hugging Face fallback: prithivMLmods/Bone-Fracture-Detection (SigLIP2 vision transformer,
+    binary Fractured/Not Fractured, ~83% accuracy per its own model card) -- used only when
+    Roboflow is unreachable, and only to answer OK-vs-fracture-present; like the Roboflow tier, it
+    has no dislocation-specific class of its own."""
+    global _bone_hf_model, _bone_hf_load_error
+    if _bone_hf_model is not None or _bone_hf_load_error is not None:
+        return _bone_hf_model
     try:
-        import torch
-        from huggingface_hub import hf_hub_download
+        from transformers import pipeline
 
-        ckpt_path = hf_hub_download(
-            repo_id="shr3m/fetal-brain-plane-cnn", filename="FINAL-test-evaluation.pt",
-            local_dir=os.path.join(MODELS_DIR, "Maternal"),
+        _bone_hf_model = pipeline(
+            "image-classification", model="prithivMLmods/Bone-Fracture-Detection",
+            cache_dir=os.path.join(MODELS_DIR, "Bone", "hf_cache"),
         )
-        net = FetalPlaneCNN.build()
-        state = torch.load(ckpt_path, map_location="cpu")
-        state = state.get("state_dict", state) if isinstance(state, dict) else state
-        net.load_state_dict(state, strict=False)
-        net.eval()
-        _maternal_model = net
-    except Exception as e:
-        _maternal_load_error = str(e)
-        _maternal_model = None
-    return _maternal_model
+    except Exception as e:  # missing dep (transformers), no internet, corrupted cache, etc.
+        _bone_hf_load_error = str(e)
+        _bone_hf_model = None
+    return _bone_hf_model
 
 
-def maternal_available() -> bool:
-    return load_maternal_model() is not None
+def bone_hf_available() -> bool:
+    return load_bone_model() is not None
 
 
-def _predict_maternal_roboflow(pil_image: Image.Image) -> dict:
-    """Primary path: the user's own trained model on Roboflow (model_id hash-maternal-health/1).
-    Grounded from its COCO taxonomy (Models/Maternal/Data Set/.../_annotations.coco.json): the
-    project has exactly one real class, 'abnormal' — a single-class detector, same semantics as
-    Mammography: any detection = a genuine flagged finding, no detection = normal."""
-    predictions = _roboflow_infer(ROBOFLOW_MATERNAL_MODEL_ID, pil_image)
-    top = _top_box(predictions)
-    ga = random.randint(18, 38)
-    if top is None:
+def _bone_subtype(pil_image: Image.Image):
+    """Best-effort Shift-vs-Crack sub-typing for an image a presence tier already confirmed shows
+    SOME fracture. Tries the locally-trained classifier first, then the offline pixel-diff
+    heuristic (both built on the real Dislocation-vs-other-fracture-type split -- see
+    offline_cv.py). Returns (label, detail, source_note, bbox); a generic "not determined" 4-tuple
+    if neither tier is available yet (e.g. before `python train_local_model.py bone` has run and
+    with no images manually dropped into Models/Bone/positive|negative/)."""
+    try:
+        r = _predict_local_trained("bone", pil_image)
+        if r is not None:
+            return r["bi_rads"], r["acr"], r["source"], r.get("bbox")
+    except Exception:
+        pass
+    try:
+        import offline_cv
+
+        r = offline_cv.predict("bone", pil_image)
+        if r is not None:
+            return r["bi_rads"], r["acr"], r["source"], r.get("bbox")
+    except Exception:
+        pass
+    return ("Crack - Fracture detected (sub-type not determined)", "N/A - No detection",
+            "sub-type undetermined this run (no local Bone dataset/classifier available)", None)
+
+
+def _bone_result(is_fracture: bool, confidence: float, bbox, presence_source: str, pil_image: Image.Image) -> dict:
+    if not is_fracture:
         return {
-            "bi_rads": "BI-RADS 1 - Negative", "acr": "A - Almost entirely fatty",
-            "verdict": "Fetal Health Normal", "sub": "Real-model: no finding detected (Roboflow)",
-            "css": "success", "loc": "Intrauterine", "extra": f"Gestational Age: {ga}W",
-            "vicon": "✅", "confidence": random.uniform(96.0, 99.0), "sms": "FH:OK", "is_critical": False,
-            "source": f"Roboflow {ROBOFLOW_MATERNAL_MODEL_ID} (imaad-ullah-khan-yameen, real inference)",
+            "bi_rads": BONE_STATUS_OPTIONS[0], "acr": "N/A - No detection", "verdict": "Bone OK",
+            "sub": "No fracture or dislocation detected", "css": "success",
+            "loc": "No focal abnormality identified", "extra": "N/A - No detection", "vicon": "✅",
+            "confidence": confidence, "sms": "BONE:OK", "is_critical": False, "source": presence_source,
         }
-    confidence = float(top.get("confidence", 0.0)) * 100.0
-    label = str(top.get("class", "abnormal"))
+    label, detail, subtype_source, subtype_bbox = _bone_subtype(pil_image)
+    is_shift = label.startswith("Shift")
     return {
-        "bi_rads": "BI-RADS 4B - Moderate suspicion", "acr": "C - Heterogeneously dense",
-        "verdict": "Abnormal Finding Detected", "sub": f"Real-model: {label} (Roboflow, your trained model)",
-        "css": "danger", "loc": "See bounding box", "extra": f"Gestational Age: {ga}W",
-        "vicon": "⚠️", "confidence": confidence, "sms": "FH:ABN", "is_critical": True,
-        "source": f"Roboflow {ROBOFLOW_MATERNAL_MODEL_ID} (imaad-ullah-khan-yameen, real inference)",
+        "bi_rads": label, "acr": detail, "verdict": f"Bone {'Shift' if is_shift else 'Crack'}",
+        "sub": f"Fracture confirmed ({presence_source}); sub-type via {subtype_source}",
+        "css": "danger", "loc": "See bounding box", "extra": detail, "vicon": "⚠️",
+        "confidence": confidence, "sms": "BONE:SHIFT" if is_shift else "BONE:CRACK",
+        "is_critical": True, "source": presence_source, "bbox": subtype_bbox or bbox,
     }
 
 
-def predict_maternal(pil_image: Image.Image) -> dict:
-    invalid = check_image_domain("maternal", pil_image)
+def _predict_bone_roboflow(pil_image: Image.Image) -> dict:
+    """Primary path: yakin/bone-fracture-tn84w/1 -- the only version of this public Roboflow
+    Universe project with an actually trained/deployed model (real measured precision 86.5%,
+    recall 71.1%, mAP@50 77.3%, grounded via a real API call to its training summary; see
+    MODEL_SOURCES.md). Its own trained taxonomy is one merged "fracture present" class, so any
+    detection at all just means "some kind of fracture" -- sub-typing happens separately."""
+    predictions = _roboflow_infer(ROBOFLOW_BONE_MODEL_ID, pil_image)
+    top = _top_box(predictions)
+    source = f"Roboflow {ROBOFLOW_BONE_MODEL_ID} (public Universe project, real inference)"
+    if top is None:
+        confidence = random.uniform(94.0, 98.5)  # no detection at all => treat as clear
+        return _bone_result(False, confidence, None, source, pil_image)
+    confidence = float(top.get("confidence", 0.0)) * 100.0
+    return _bone_result(True, confidence, None, source, pil_image)
+
+
+def predict_bone(pil_image: Image.Image) -> dict:
+    invalid = check_image_domain("bone", pil_image)
     if invalid is not None:
         return invalid
 
     try:
-        return _predict_maternal_roboflow(pil_image)
+        return _predict_bone_roboflow(pil_image)
     except RoboflowError:
         pass  # no key / offline / call failed — fall through to the offline paths below
 
-    try:
-        import offline_cv
-
-        # Currently always returns None for this modality: the Maternal dataset has zero
-        # unannotated/negative images to build a negative reference from (every local image is
-        # an annotated 'abnormal' case) — see offline_cv.calibrate(). Kept here (harmless) so
-        # this modality picks it up automatically if the dataset ever gains negative examples.
-        r = offline_cv.predict("maternal", pil_image)
-        if r is not None:
-            return r
-    except Exception:
-        pass
-
-    try:
-        # Not trained yet as of this writing — train_local_model.py skips Maternal until the
-        # dataset (or Models/Maternal/negative/) has at least one real negative image; kept here
-        # (harmless no-op until then) so this tier activates automatically once that changes.
-        r = _predict_local_trained("maternal", pil_image)
-        if r is not None:
-            return r
-    except Exception:
-        pass
-
-    model = load_maternal_model()
+    model = load_bone_model()
     if model is None:
         return None
     try:
-        import torch
-
-        img = pil_image.convert("L").resize((224, 224))
-        arr = (np.asarray(img).astype(np.float32) / 255.0 - _FETAL_MEAN) / _FETAL_STD
-        tensor = torch.from_numpy(arr).unsqueeze(0).unsqueeze(0).float()
-        with torch.no_grad():
-            logits = model(tensor)
-            probs = torch.softmax(logits, dim=1)[0].numpy()
-        idx = int(np.argmax(probs))
-        plane, confidence = _FETAL_CLASSES[idx], float(probs[idx]) * 100.0
-        ga = random.randint(18, 38)
-        return {
-            "bi_rads": "BI-RADS 1 - Negative", "acr": "A - Almost entirely fatty",
-            "verdict": f"Standard Plane: {plane}", "sub": "Real-model plane classification (CNN)",
-            "css": "success", "loc": "Intrauterine", "extra": f"Gestational Age: {ga}W",
-            "vicon": "✅", "confidence": confidence, "sms": "FH:OK", "is_critical": False,
-            "source": "shr3m/fetal-brain-plane-cnn (Hugging Face, real inference)",
-        }
+        preds = model(pil_image.convert("RGB"))
+        top = max(preds, key=lambda p: p.get("score", 0.0))
+        label = str(top.get("label", "")).strip().lower()
+        confidence = float(top.get("score", 0.0)) * 100.0
+        is_fracture = "not" not in label  # model card order: "Fractured" (0) / "Not Fractured" (1)
+        source = "prithivMLmods/Bone-Fracture-Detection (Hugging Face, SigLIP2, real inference)"
+        return _bone_result(is_fracture, confidence, None, source, pil_image)
     except Exception:
         return None
 
@@ -805,12 +794,11 @@ def predict_mammography(pil_image: Image.Image) -> dict:
 
 def model_status() -> dict:
     """One line per modality: whether it's backed by a real model, and why not if not. Try order
-    (see predict_tb/predict_maternal/predict_mammography), best-measured-first: TB tries the
+    (see predict_tb/predict_bone/predict_mammography), best-measured-first: TB tries the
     locally-trained MobileNetV3 first (82.5% held-out, see train_local_model.py) then the offline
-    pixel-diff heuristic (74%) then Roboflow (biased, see MODEL_SOURCES.md); Mammography and
-    Maternal try Roboflow first (the purpose-trained hosted models), then the offline pixel-diff
-    heuristic, then the locally-trained classifier, then the offline Hugging Face model as the
-    deepest fallback."""
+    pixel-diff heuristic (74%) then Roboflow (biased, see MODEL_SOURCES.md); Mammography and Bone
+    try Roboflow first (the presence-of-finding detector), then the offline pixel-diff heuristic /
+    locally-trained sub-typer, then the offline Hugging Face model as the deepest fallback."""
     roboflow_ok = _roboflow_api_key() is not None
     try:
         import offline_cv
@@ -821,7 +809,7 @@ def model_status() -> dict:
         offline_cv_tb = offline_cv_mammo = False
     local_tb = local_model_available("tb")
     local_mammo = local_model_available("mammography")
-    local_maternal = local_model_available("maternal")
+    local_bone = local_model_available("bone")
 
     return {
         "Mammography (YOLOv8-OBB)": {
@@ -844,12 +832,13 @@ def model_status() -> dict:
             else ("offline_cv.py heuristic (local tuberculosis.coco dataset)" if offline_cv_tb
                   else (f"Roboflow {ROBOFLOW_TB_MODEL_ID}" if roboflow_ok else "sukhmani1303/tuberculosis-vit-model (Hugging Face)")),
         },
-        "Maternal Health (Ultrasound)": {
-            "real": roboflow_ok or local_maternal or maternal_available(),
-            "reason": "OK (Roboflow model)" if roboflow_ok
-            else ("OK (locally-trained classifier)" if local_maternal else (_maternal_load_error or "OK")),
-            "source": f"Roboflow {ROBOFLOW_MATERNAL_MODEL_ID}" if roboflow_ok
-            else ("Models/Maternal/local_model.pt (trained via train_local_model.py)" if local_maternal
-                  else "shr3m/fetal-brain-plane-cnn (Hugging Face)"),
+        "Bone X-Ray (Fracture/Dislocation)": {
+            "real": roboflow_ok or local_bone or bone_hf_available(),
+            "reason": "OK (Roboflow real-time detector; Shift/Crack sub-type needs the local dataset/classifier too)" if roboflow_ok
+            else ("OK (locally-trained Shift/Crack classifier)" if local_bone
+                  else (_bone_hf_load_error or "OK")),
+            "source": f"Roboflow {ROBOFLOW_BONE_MODEL_ID} (public Universe project)" if roboflow_ok
+            else ("Models/Bone/local_model.pt (trained via train_local_model.py)" if local_bone
+                  else "prithivMLmods/Bone-Fracture-Detection (Hugging Face)"),
         },
     }

@@ -17,6 +17,10 @@ torch>=2.0.0
 torchvision>=0.15.0
 ultralytics>=8.0.0
 huggingface_hub>=0.20.0
+# Only needed for Bone's offline Hugging Face fallback (SigLIP2 classifier, see MODEL_SOURCES.md).
+# TB/Mammography's HF integrations were hand-built without this dependency on purpose; Bone's
+# fallback uses a `transformers` pipeline instead of reimplementing SigLIP2 by hand.
+transformers>=4.49.0
 
 # Optional: only needed if you provide a Roboflow API key for the real mammography model
 # (see MODEL_SOURCES.md). Safe to leave installed even if unused.

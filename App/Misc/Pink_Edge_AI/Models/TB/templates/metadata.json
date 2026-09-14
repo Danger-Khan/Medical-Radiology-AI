@@ -1,0 +1,32 @@
+{
+  "positive_samples_available": 5899,
+  "negative_samples_available": 3586,
+  "positive_samples_used": 150,
+  "negative_samples_used": 150,
+  "manual_signature": [
+    [
+      "TB\\negative\\h0504_png_jpg.rf.ouyQ4YU8ovMdRJokCAsP.jpg",
+      1789234274.39329
+    ],
+    [
+      "TB\\negative\\h0993_png_jpg.rf.MrygKQit4Hm3qdgHruDq.jpg",
+      1789234186.028618
+    ],
+    [
+      "TB\\negative\\h1064_png_jpg.rf.LhgQ0HWn5uPiW4DG2SSU.jpg",
+      1789234230.4396653
+    ],
+    [
+      "TB\\positive\\tb0065_png_jpg.rf.KLCK4DMNvBEvqmGHs8FB.jpg",
+      1789234230.413451
+    ],
+    [
+      "TB\\positive\\tb0742_png_jpg.rf.qguPuh36skwUZT3082a6.jpg",
+      1789234235.8394506
+    ],
+    [
+      "TB\\positive\\tb0829_png_jpg.rf.THruhf5LP9MOp9gCq5m8.jpg",
+      1789234164.4585805
+    ]
+  ]
+}

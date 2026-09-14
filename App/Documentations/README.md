@@ -1,15 +1,16 @@
-## Pink Edge AI
-Offline Edge AI Mammography Triage on Rockchip RK3588 NPU.
-Alibaba Cloud AI Hackathon 2026 Submission.
+## Medical Radiology AI
+Offline Edge AI Radiology Triage on Rockchip RK3588 NPU.
+Rebuilt from an earlier submission under this repo, Pink Edge AI (Alibaba Cloud AI Hackathon 2026)
+— see the root README's "Relationship to Pink Edge AI" section.
 
 ## Overview
-Pink Edge AI is a hybrid-edge clinical intelligence platform designed for rural healthcare centers in Punjab, Pakistan. It runs AI-powered medical imaging triage 100% offline on low-cost edge hardware (Rockchip RK3588 NPU) and uses Alibaba Cloud as an optional background sync layer when internet connectivity becomes available.
+Medical Radiology AI is a hybrid-edge clinical intelligence platform designed for rural healthcare centers in Punjab, Pakistan. It runs AI-powered medical imaging triage 100% offline on low-cost edge hardware (Rockchip RK3588 NPU) and uses Alibaba Cloud as an optional background sync layer when internet connectivity becomes available.
 
 **The platform currently supports three diagnostic models:**
 
 1. Mammography (Breast Cancer Screening)
 2. Tuberculosis (Chest X-Ray Analysis)
-3. Maternal Health (Ultrasound Triage)
+3. Bone X-Ray (Fracture / Dislocation Triage)
 
 The system is specifically built for Lady Health Visitors (LHVs) working at Basic Health Units (BHUs) in rural areas where no radiologist is available and internet connectivity is unreliable.
 
@@ -19,10 +20,10 @@ The system is specifically built for Lady Health Visitors (LHVs) working at Basi
 Rural Punjab lacks breast cancer screening. No radiologists at village clinics. No internet for cloud AI. Late detection costs lives.
 
 ## Solution 
-Pink Edge AI runs 100% offline on cheap edge hardware.
+Medical Radiology AI runs 100% offline on cheap edge hardware.
 * Mammography (Breast Cancer Screening): It performs real-time mammography triage using YOLOv8-OBB. When internet becomes available, it syncs critical data to Alibaba Cloud as a backup layer.
 * Tuberculosis (Chest X-Ray Engine): Processes local digital X-ray scans offline to detect pulmonary opacities and cavitary lesions, routing critical findings to the Allied Hospital hub via 2G GSM.
-* Maternal Health (Ultrasound Engine): Analyzes off-grid ultrasound video streams natively to identify standard anatomical planes and fetal growth parameters with zero cloud reliance.
+* Bone X-Ray Engine: Analyzes limb/joint radiographs offline to flag a fracture ("Crack") or a dislocation ("Shift"), with zero cloud reliance.
 
 ## Architecture
 ```text
@@ -45,7 +46,7 @@ Allied Hospital (Urban Hub)
 ## Features
 
 1. Offline AI Inference — YOLOv8-OBB on RK3588 NPU with INT8 quantization.
-2. Multi-Modal — Mammography, Tuberculosis, Maternal Health.
+2. Multi-Modal — Mammography, Tuberculosis, Bone X-Ray.
 3. Clinical Output — BI-RADS 0-6, ACR Density A-D, confidence scores.
 4. Local Cache — SQLite3 database for offline storage.
 5. PDF and Text Reports — Downloadable without internet.
@@ -72,19 +73,20 @@ Allied Hospital (Urban Hub)
 Step 1: Clone the repository.
 
 ```bash
-git clone https://github.com/Zobia-Irshad/Pink_Edge_AI.git
-cd pink-edge-ai
+git clone https://github.com/Danger-Khan/Medical-Radiology-AI.git
+cd Medical-Radiology-AI/App
 ```
 
 Step 2: Install dependencies.
 ```bash
-pip install streamlit numpy opencv-python Pillow fpdf2
+pip install -r requirements.txt
 ```
 
 Step 3: Run the application.
 ```bash
-streamlit run pink_edge.py
+streamlit run radiology_web.py
 ```
+(or `python radiology_console.py` for the desktop edition — see the root `README.md`.)
 
 ## Usage
 

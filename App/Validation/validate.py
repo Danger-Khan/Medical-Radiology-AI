@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Pink Edge AI (Desktop) — validation suite.
+Medical Radiology AI (Desktop) — validation suite.
 ============================================
-Self-contained smoke/validation test for GUI.py + inference.py + streamlit_app.py — 21 checks:
+Self-contained smoke/validation test for radiology_console.py + inference.py + radiology_web.py — 21 checks:
 imports, imaging, simulated scenario generators, SQLite cache round-trip, text/PDF report
 generation, real model inference for all three modalities on both synthetic AND real Test Data/
 images (each modality tries several real-inference tiers in an order set by measured accuracy —
@@ -20,7 +20,7 @@ methods themselves, not just the backend functions they call.
 Run with:  python Validation/validate.py   (from anywhere — paths below are anchored to the
 repo root, not the current working directory)
 Exits 0 if every check passes, 1 otherwise. Uses a throwaway DB file under Validation/ (never
-touches the app's real pink_edge_cache.db at the project root) and cleans up after itself.
+touches the app's real radiology_cache.db at the project root) and cleans up after itself.
 """
 import os
 import sys
@@ -31,7 +31,7 @@ from glob import glob
 VALIDATION_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.dirname(VALIDATION_DIR)
 TEST_DATA_DIR = os.path.join(ROOT_DIR, "Test Data")
-sys.path.insert(0, ROOT_DIR)  # so `import GUI` / `import inference` resolve from Validation/
+sys.path.insert(0, ROOT_DIR)  # so `import radiology_console` / `import inference` resolve from Validation/
 
 RESULTS = []  # (name, ok, detail)
 
@@ -74,19 +74,19 @@ def validate_result_shape(r, where):
 
 # ============================================================
 print("=" * 70)
-print("PINK EDGE AI (DESKTOP) — VALIDATION SUITE")
+print("MEDICAL RADIOLOGY AI (DESKTOP) — VALIDATION SUITE")
 print("=" * 70)
 
 # ---- 1. imports ----
-@check("import GUI and inference modules")
+@check("import radiology_console and inference modules")
 def _():
     global GUI, inf
-    import GUI as GUI  # noqa
+    import radiology_console as GUI  # noqa -- kept as the `GUI` alias so every GUI.xxx call below is unchanged
     import inference as inf  # noqa
 
 
 # ---- 2. imaging ----
-@check("placeholder image generation (mammogram/xray/ultrasound)")
+@check("placeholder image generation (mammogram/xray/bone)")
 def _():
     for model in GUI.MODELS:
         img = GUI.load_placeholder(model, seed=1)
@@ -105,9 +105,9 @@ def _():
 
 
 # ---- 3. simulated scenario generators ----
-@check("simulated scenario generators (mammography/tb/maternal)")
+@check("simulated scenario generators (mammography/tb/bone)")
 def _():
-    for fn, where in [(GUI.sim_mammography, "mammography"), (GUI.sim_tb, "tb"), (GUI.sim_maternal, "maternal")]:
+    for fn, where in [(GUI.sim_mammography, "mammography"), (GUI.sim_tb, "tb"), (GUI.sim_bone, "bone")]:
         for _i in range(5):
             r = fn()
             validate_result_shape(r, f"sim_{where}")
@@ -176,7 +176,7 @@ def _():
         "model_source": "unit-test", "synced": 0,
     }
     txt = GUI.generate_text_report(d)
-    require("PINK EDGE AI" in txt and str(d["patient_id"]) in txt, "text report missing expected content")
+    require("MEDICAL RADIOLOGY AI" in txt and str(d["patient_id"]) in txt, "text report missing expected content")
     require("URGENT" in txt, "BI-RADS 5 should trigger an URGENT referral line")
 
     pdf_bytes = GUI.generate_pdf_bytes(d)
@@ -185,7 +185,7 @@ def _():
     require(pdf_bytes[:4] == b"%PDF", "PDF output does not start with a %PDF header")
 
 
-# ---- 6. real model inference (TB + Maternal) ----
+# ---- 6. real model inference (TB + Bone) ----
 @check("TB real-model inference on a synthetic chest X-ray")
 def _():
     require(inf.tb_available(), f"TB model failed to load: {inf._tb_load_error}")
@@ -196,14 +196,17 @@ def _():
     require(is_real_source(r["source"]), f"TB result should be tagged as real, not simulated: {r['source']!r}")
 
 
-@check("Maternal real-model inference on a synthetic ultrasound")
+@check("Bone real-model inference on a synthetic X-ray")
 def _():
-    require(inf.maternal_available(), f"Maternal model failed to load: {inf._maternal_load_error}")
-    img = GUI.gen_ultrasound(seed=4)
-    r = inf.predict_maternal(img)
-    require(r is not None, "predict_maternal returned None despite model being available")
-    validate_result_shape(r, "predict_maternal")
-    require(is_real_source(r["source"]), f"Maternal result should be tagged as real, not simulated: {r['source']!r}")
+    # Bone's real tiers are Roboflow (primary) and the HF SigLIP2 fallback -- at least one must be
+    # reachable in this environment, same bar as TB's tb_available() above.
+    require(inf._roboflow_api_key() is not None or inf.bone_hf_available(),
+            f"Bone has no real tier available (no Roboflow key, HF load error: {inf._bone_hf_load_error})")
+    img = GUI.gen_bone_xray(seed=4)
+    r = inf.predict_bone(img)
+    require(r is not None, "predict_bone returned None despite a real tier being available")
+    validate_result_shape(r, "predict_bone")
+    require(is_real_source(r["source"]), f"Bone result should be tagged as real, not simulated: {r['source']!r}")
 
 
 @check("Mammography: real Roboflow workflow if a key is configured, else SIMULATED")
@@ -236,17 +239,17 @@ def _():
         print(f"    {os.path.basename(f):40s} -> {r['verdict']:15s} ({r['confidence']:.1f}%)")
 
 
-@check("Maternal real-model inference on real samples (Test Data/Maternal)")
+@check("Bone real-model inference on real samples (Test Data/Bone)")
 def _():
     from PIL import Image
 
-    files = sorted(glob(os.path.join(TEST_DATA_DIR, "Maternal", "*")))
-    require(len(files) > 0, f"no sample files found under {TEST_DATA_DIR}\\Maternal")
+    files = sorted(glob(os.path.join(TEST_DATA_DIR, "Bone", "*")))
+    require(len(files) > 0, f"no sample files found under {TEST_DATA_DIR}\\Bone")
     for f in files:
         img = Image.open(f)
-        r = inf.predict_maternal(img)
-        require(r is not None, f"predict_maternal returned None on real sample: {os.path.basename(f)}")
-        validate_result_shape(r, f"predict_maternal({os.path.basename(f)})")
+        r = inf.predict_bone(img)
+        require(r is not None, f"predict_bone returned None on real sample: {os.path.basename(f)}")
+        validate_result_shape(r, f"predict_bone({os.path.basename(f)})")
         print(f"    {os.path.basename(f):40s} -> {r['verdict']:25s} ({r['confidence']:.1f}%)")
 
 
@@ -402,7 +405,7 @@ def _():
     for modality, predict_fn, folder in (
         ("tb", inf.predict_tb, "Tuberculosis"),
         ("mammography", inf.predict_mammography, "Breast Cancer"),
-        ("maternal", inf.predict_maternal, "Maternal"),
+        ("bone", inf.predict_bone, "Bone"),
     ):
         r_noise = predict_fn(noise)
         require(r_noise is not None, f"{modality}: predict returned None on a noise image")
@@ -412,11 +415,11 @@ def _():
 
         # Checked against several real samples, not just one, and required to mostly pass rather
         # than always pass: the domain check is a measured, imperfect heuristic (mammography's
-        # in-domain pass rate is ~90%, maternal's ~80%, see MODEL_SOURCES.md) -- asserting every
-        # single real sample must pass would make this check flaky on whichever sample happens to
-        # be the unlucky one, while still catching a genuine regression (the gate rejecting
-        # most/all real scans). Below 3 samples (Maternal has exactly 1 in Test Data/) there isn't
-        # enough evidence to assert against a heuristic with a known <100% pass rate -- report only.
+        # in-domain pass rate is ~90%, bone's ~100% but at a very lenient threshold, see
+        # MODEL_SOURCES.md) -- asserting every single real sample must pass would make this check
+        # flaky on whichever sample happens to be the unlucky one, while still catching a genuine
+        # regression (the gate rejecting most/all real scans). Below 3 samples there isn't enough
+        # evidence to assert against a heuristic with a known <100% pass rate -- report only.
         real_files = sorted(glob(os.path.join(TEST_DATA_DIR, folder, "*")))[:5]
         passed = sum(not predict_fn(Image.open(p)).get("invalid_image") for p in real_files)
         if len(real_files) >= 3:
@@ -462,21 +465,33 @@ def _():
             f"worse than a coin flip, likely a real integration bug, not just model noise")
 
 
-@check("Maternal Health Roboflow model matches ground truth on an annotated sample")
+@check("Bone Roboflow model detects at least some known-Dislocation ground truth")
 def _():
+    """Deliberately a weak floor, not a per-sample assertion like TB's/Mammography's checks above
+    -- measured directly against this exact dataset: only 2/16 real 'Dislocation'-annotated test
+    images actually trigger a detection from the deployed bone-fracture-tn84w/1 model (its own
+    official recall, 71.1%, was measured on ITS OWN 2023 single-class training/test split, not
+    this project's richer 2025 re-annotation used here -- a real, measured gap, not a bug; see
+    MODEL_SOURCES.md). Requiring "at least one hit across every available sample" still catches a
+    genuine regression (the integration breaking entirely) without being flaky about which
+    individual sample happens to be one of the ~1-in-8 that fires."""
     if not inf._roboflow_api_key():
         return
-    ds_dir = os.path.join(ROOT_DIR, "Models", "Maternal", "Data Set", "HASH Maternal Health.coco", "test")
+    ds_dir = os.path.join(ROOT_DIR, "Models", "Bone", "Data Set", "Bone-Fracture.coco", "test")
     ann_path = os.path.join(ds_dir, "_annotations.coco.json")
     require(os.path.isfile(ann_path), f"no COCO annotations found at {ann_path}")
 
-    pos = _first_image_for_category(ann_path, ds_dir, "abnormal")
-    require(pos is not None, "no 'abnormal' annotated sample found to cross-check against")
-    img, name = pos
-    r = inf.predict_maternal(img)
-    require(r is not None, "predict_maternal returned None on a known-abnormal annotated sample")
-    require(r["is_critical"], f"ground truth is abnormal but the model said {r['verdict']!r}")
-    print(f"    {name} (ground truth: abnormal) -> {r['verdict']} ({r['confidence']:.1f}%)")
+    samples = _images_for_category(ann_path, ds_dir, "Dislocation", limit=16)
+    require(len(samples) > 0, "no 'Dislocation' annotated sample found to cross-check against")
+    hits = 0
+    for img, name in samples:
+        r = inf.predict_bone(img)
+        require(r is not None, f"predict_bone returned None on known-Dislocation sample {name}")
+        hits += bool(r["is_critical"])
+        print(f"    {name} (ground truth: Dislocation) -> {r['verdict']} ({r['confidence']:.1f}%) "
+              f"{'HIT' if r['is_critical'] else 'miss'}")
+    require(hits > 0, f"0/{len(samples)} known-Dislocation samples detected anything -- "
+            "likely a real integration break, not just this model's known weak recall on this data")
 
 
 # ---- 7. run_triage() dispatcher (what the UI actually calls) ----
@@ -493,7 +508,7 @@ def _():
 _TEST_DATA_BY_MODEL = {
     "Mammography (YOLOv8-OBB)": "Breast Cancer",
     "Tuberculosis (Chest X-Ray)": "Tuberculosis",
-    "Maternal Health (Ultrasound)": "Maternal",
+    "Bone X-Ray (Fracture/Dislocation)": "Bone",
 }
 
 
@@ -509,7 +524,7 @@ def _():
     orig_db_path = GUI.DB_PATH
     GUI.DB_PATH = tk_test_db
     try:
-        app = GUI.PinkEdgeApp(root)
+        app = GUI.RadiologyConsoleApp(root)
         root.update()
         require(app.notebook.index("end") == 3, "expected 3 notebook tabs")
 
@@ -603,7 +618,7 @@ def _():
     orig_db_path = GUI.DB_PATH
     GUI.DB_PATH = tk_test_db
     try:
-        at = AppTest.from_file(os.path.join(ROOT_DIR, "streamlit_app.py"))
+        at = AppTest.from_file(os.path.join(ROOT_DIR, "radiology_web.py"))
         at.run(timeout=60)
         require(not at.exception, f"initial script run raised: {at.exception}")
         require(len(at.tabs) == 3, f"expected 3 tabs (Dashboard/Hospital Hub/Cloud Sync), got {len(at.tabs)}")

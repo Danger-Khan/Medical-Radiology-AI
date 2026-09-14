@@ -7,12 +7,14 @@ App/Models/*/*.onnx
 App/Models/*/local_model_metadata.json
 App/Models/*/.cache/
 App/Models/*/*/.cache/
+App/Models/Bone/hf_cache/
 
 # offline_cv.py's generated reference templates — deterministically rebuilt from the datasets
 # already in Models/*/Data Set/ on first use, no need to commit the derived output.
 App/Models/*/templates/
 
 # Local runtime artifacts
+radiology_cache.db
 pink_edge_cache.db
 App/Validation/validation_test_cache.db
 App/Misc/Pink_Edge_AI-main/Pink_Edge_AI-main/pink_edge_cache.db
